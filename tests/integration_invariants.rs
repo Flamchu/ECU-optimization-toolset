@@ -11,15 +11,15 @@ use ecu_shenanigans::platform::amf_edc15p::envelope::CAPS;
 use ecu_shenanigans::util::resample_to_uniform;
 
 #[test]
-fn cargo_version_is_v4() {
-    assert_eq!(ecu_shenanigans::VERSION, "4.0.0");
+fn cargo_version_is_5_0_0() {
+    assert_eq!(ecu_shenanigans::VERSION, "5.0.0");
 }
 
 #[test]
 fn cargo_binary_name_unchanged() {
     let cargo = std::fs::read_to_string("Cargo.toml").expect("Cargo.toml");
     assert!(cargo.contains("name = \"ecu-shenanigans\""));
-    assert!(cargo.contains("version = \"4.0.0\""));
+    assert!(cargo.contains("version = \"5.0.0\""));
 }
 
 /// Build the wrong-turbo identifier at runtime so this very file

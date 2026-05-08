@@ -19,14 +19,14 @@ fn synthetic_pull() -> Pull {
 }
 
 #[test]
-fn all_21_rule_ids_have_distinct_string_ids() {
+fn all_rule_ids_have_distinct_string_ids() {
     use std::collections::HashSet;
     let mut seen: HashSet<&'static str> = HashSet::new();
     for &id in ALL_RULE_IDS {
         assert!(seen.insert(id.as_str()),
             "RuleId::{} produces duplicate string id {}", id.as_str(), id.as_str());
     }
-    assert_eq!(seen.len(), 21, "v4 has 21 rules");
+    assert_eq!(seen.len(), 23, "rule pack has 23 rules");
 }
 
 #[test]
@@ -35,7 +35,7 @@ fn rule_id_iteration_order_matches_canonical() {
     assert_eq!(names, vec![
         "R01", "R02", "R03", "R04", "R05", "R06", "R07",
         "R08", "R09", "R10", "R11", "R12", "R13", "R14", "R15",
-        "R16", "R17", "R18", "R19", "R20", "R21",
+        "R16", "R17", "R18", "R19", "R20", "R21", "R22", "R23",
     ]);
 }
 

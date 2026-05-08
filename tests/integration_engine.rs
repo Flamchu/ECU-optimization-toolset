@@ -60,7 +60,7 @@ fn recommendation_count_matches_default_deltas_table() {
     let result = analyse(df, log);
     let recs = recommend(&result.findings);
     assert_eq!(recs.len(), DEFAULT_DELTAS.len());
-    assert_eq!(recs.len(), 22);
+    assert_eq!(recs.len(), 25);
 }
 
 #[test]
