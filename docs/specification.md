@@ -14,7 +14,7 @@ Build a desktop tool that ingests **VCDS** (`.csv`) datalogs, reconstructs them 
 
 The previous version of this repo carried a second platform (Honda Civic R18 / K-series). **That platform is being removed entirely.** All references, folders, channel maps, rule files, fixtures, and tests for `civic_r18` must be deleted. The tool is now single-platform.
 
-## 2. Platform deep-dive — AMF / EDC15P+ / KP35
+## 2. Platform deep-dive — AMF / EDC15P+ / Garrett GT1544S
 
 ### 2.1 Vehicle & engine
 
@@ -28,7 +28,7 @@ The previous version of this repo carried a second platform (Honda Civic R18 / K
 | Stock power | 55 kW / 75 PS @ 4000 rpm | |
 | Stock torque | 195 Nm @ 2200 rpm | |
 | Injection | **Pumpe Düse** unit injectors, cam-driven, ~2050 bar peak | NOT common-rail |
-| Turbo | **KKK KP35**, wastegated, **fixed geometry** | NOT VNT — this matters for control philosophy |
+| Turbo | **Garrett GT1544S**, wastegated, **fixed geometry** | NOT VNT — this matters for control philosophy |
 | Intercooler | Air-air, small | Heat-soak limited |
 | MAF | Bosch HFM5 (hot-film), housing matched to ~70 mm/3-cyl, **datasheet ceiling ~640 kg/h** | Reports `mg/stroke` to ECU |
 | MAP | Combined T-MAP after intercooler, ~2.5 bar absolute sensor range (saturates ~2495 mbar) | |
@@ -50,7 +50,7 @@ These are the values the recommendation engine should assume the **OEM map** con
 
 ### 2.3 Sane Stage 1 target envelope (final figures)
 
-A "sane" Stage 1 on AMF is **not** the 105–125 hp number quoted by aggressive shops. Those tunes either smoke, kill the KP35 by overspeed, or chew the LUK SMF. The target here:
+A "sane" Stage 1 on AMF is **not** the 105–125 hp number quoted by aggressive shops. Those tunes either smoke, kill the Garrett GT1544S by overspeed, or chew the LUK SMF. The target here:
 
 | Metric | Stock | **Sane Stage 1 target** | Aggressive (NOT this tool's target) |
 |---|---|---|---|
@@ -65,7 +65,7 @@ A "sane" Stage 1 on AMF is **not** the 105–125 hp number quoted by aggressive 
 ### 2.4 Known weak points (drive every rule's rationale)
 
 1. **LUK SMF clutch** — designed around 195 Nm. Above ~240 Nm at the flywheel it slips, then judders, then dies. This is the single dominant longevity constraint.
-2. **KP35 compressor** — small wastegated turbo. Compressor map peak efficiency island sits roughly at PR ~1.9–2.1 / ~7–8 lb/min. Sustained operation above PR 2.15 (i.e. >2150 mbar absolute at sea level) puts you off the right edge of the map → rapidly rising outlet temp, shaft over-speed (rated ~206 000 rpm), bearing failure within months. Community-quoted longevity ceiling: **~2100 mbar absolute, with taper to ~1900 by 4500 rpm.**
+2. **Garrett GT1544S compressor** — small wastegated turbo. Compressor map peak efficiency island sits roughly at PR ~1.9–2.1 / ~7–8 lb/min. Sustained operation above PR 2.15 (i.e. >2150 mbar absolute at sea level) puts you off the right edge of the map → rapidly rising outlet temp, shaft over-speed (rated ~206 000 rpm), bearing failure within months. Community-quoted longevity ceiling: **~2100 mbar absolute, with taper to ~1900 by 4500 rpm.**
 3. **PD injectors** at ~50 mg/stroke approach the duration headroom of the stock cam lobe — EOI starts pushing past 6° ATDC and EGT climbs sharply.
 4. **Cast-iron manifold** is durable but cracks at the runner-collector weld under repeated 850 °C+ thermal cycles.
 5. **Stock pistons** — aluminium, no oil-jets on AMF. SOI advance >27° BTDC at high IQ punches a hole in piston #1 (closest to belt end, hottest).
@@ -137,10 +137,10 @@ Every rule is a `pydantic` model with: `id`, `severity` (`info | warn | critical
 
 | ID | Rule | Threshold | Severity | One-line rationale |
 |---|---|---|---|---|
-| **R01** | Underboost | `boost_actual < boost_spec − 150 mbar` for ≥ 1.0 s above 2000 rpm | warn | KP35 PID can't keep up: leak, sticky wastegate, or LDRXN ramp too steep for turbo. |
-| **R02** | Overboost spike | `boost_actual > boost_spec + 200 mbar` OR `> 2200 mbar absolute` | critical | KP35 sustained over 2150 mbar pushes shaft past the right edge of the compressor map → over-speed. |
-| **R03** | Boost target excessive | Any `boost_spec` cell > **2150 mbar** absolute (sea-level), or > stock+250 mbar | critical | Hard envelope ceiling for KP35 longevity. |
-| **R04** | High-RPM boost not tapering | `boost_spec @ 4500 rpm > boost_spec @ 3000 rpm − 100 mbar` | warn | KP35 is choke-flow-limited: you must back off above 4000 to keep it in the efficiency island. |
+| **R01** | Underboost | `boost_actual < boost_spec − 150 mbar` for ≥ 1.0 s above 2000 rpm | warn | Garrett GT1544S PID can't keep up: leak, sticky wastegate, or LDRXN ramp too steep for turbo. |
+| **R02** | Overboost spike | `boost_actual > boost_spec + 200 mbar` OR `> 2200 mbar absolute` | critical | Garrett GT1544S sustained over 2150 mbar pushes shaft past the right edge of the compressor map → over-speed. |
+| **R03** | Boost target excessive | Any `boost_spec` cell > **2150 mbar** absolute (sea-level), or > stock+250 mbar | critical | Hard envelope ceiling for Garrett GT1544S longevity. |
+| **R04** | High-RPM boost not tapering | `boost_spec @ 4500 rpm > boost_spec @ 3000 rpm − 100 mbar` | warn | Garrett GT1544S is choke-flow-limited: you must back off above 4000 to keep it in the efficiency island. |
 | **R05** | MAF below spec | `MAF_actual < MAF_spec − 8 %` over a pull | warn | MAF drift, dirty intake, boost leak, or MAF aging — fueling decisions become wrong. |
 | **R06** | Lambda floor breach | `MAF_actual / IQ_actual < 1.20 × 14.5` (i.e. λ < 1.20) at any sample | critical | Below λ = 1.20 on PD = visible smoke + EGT spike + DPF/cat damage. **1.05 is the hard "would melt pistons" floor**; we set the user-facing floor at 1.20 for margin. |
 | **R07** | Peak IQ above sane envelope | `IQ_actual > 52 mg/stroke` | critical | Above 52 mg the stock LUK clutch and stock injectors run out of headroom. |
@@ -182,11 +182,11 @@ These are absolute caps. The recommendation engine **clamps every suggested delt
 
 | Quantity | Hard cap | Why this number |
 |---|---|---|
-| Peak boost (absolute) | **2150 mbar** | Right edge of KP35 efficient compressor map at AMF flow rates. |
-| Peak boost above 4000 rpm | **2050 mbar** | KP35 chokes; sustained PR > 2.0 at high mass-flow → over-speed. |
+| Peak boost (absolute) | **2150 mbar** | Right edge of Garrett GT1544S efficient compressor map at AMF flow rates. |
+| Peak boost above 4000 rpm | **2050 mbar** | Garrett GT1544S chokes; sustained PR > 2.0 at high mass-flow → over-speed. |
 | Peak IQ | **52 mg/stroke** | Stock injector duration headroom; LUK clutch torque ceiling. |
 | Lambda floor (λ_min) | **1.20** | Below this PD smokes and EGT climbs faster than the EGT model can derate. (Hard physics floor is 1.05; we keep 0.15 of margin.) |
-| Pre-turbo EGT (modelled or measured) | **800 °C sustained** | Cast-iron manifold creep + KP35 turbine wheel material limit + AMF has no oil-jet pistons. |
+| Pre-turbo EGT (modelled or measured) | **800 °C sustained** | Cast-iron manifold creep + Garrett GT1544S turbine wheel material limit + AMF has no oil-jet pistons. |
 | SOI advance | **26° BTDC** at any IQ ≥ 30 mg | Beyond this peak cylinder pressure ahead of TDC stresses the unjacketed pistons. Physical cam-lobe limit is 35°. |
 | EOI (SOI − duration) | **10° ATDC** | Past this, heat dumps into the turbine, hurting both EGT and BSFC. |
 | Modelled flywheel torque | **240 Nm** | LUK SMF clutch ceiling (195 Nm × 1.23 headroom). |

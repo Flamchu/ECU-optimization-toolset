@@ -12,7 +12,7 @@
 | Stock power | 55 kW / 75 PS @ 4000 rpm | |
 | Stock torque | 195 Nm @ 2200 rpm | |
 | Injection | Pumpe Düse, cam-driven, ~2050 bar peak | NOT common-rail |
-| Turbo | KKK KP35, wastegated, **fixed geometry** | NOT VNT |
+| Turbo | Garrett GT1544S, wastegated, **fixed geometry** | NOT VNT |
 | Intercooler | Air-air, small | Heat-soak limited |
 | MAF | Bosch HFM5, datasheet ceiling ~640 kg/h | mg/stroke to ECU |
 | MAP | Combined T-MAP after intercooler, ~2.5 bar abs sensor | Saturates ~2495 mbar |
@@ -33,7 +33,7 @@
 ## Sane Stage 1 target envelope
 
 A "sane" Stage 1 on AMF is **not** the 105–125 hp number quoted by aggressive
-shops. Those tunes either smoke, kill the KP35 by overspeed, or chew the LUK
+shops. Those tunes either smoke, kill the Garrett GT1544S by overspeed, or chew the LUK
 SMF. The conservative target this tool aims at:
 
 | Metric | Stock | Sane Stage 1 target |
@@ -51,7 +51,7 @@ SMF. The conservative target this tool aims at:
 1. **LUK SMF clutch** — designed around 195 Nm. Above ~240 Nm at the
    flywheel it slips, then judders, then dies. Single dominant longevity
    constraint.
-2. **KP35 compressor** — small wastegated turbo. Sustained operation above
+2. **Garrett GT1544S compressor** — small wastegated turbo. Sustained operation above
    PR ~2.15 (2150 mbar absolute at sea level) puts you off the right edge of
    the compressor map → rapidly rising outlet temp, shaft over-speed
    (rated ~206 000 rpm), bearing failure within months.
