@@ -7,10 +7,13 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 
 use crate::disclaimer::DISCLAIMER;
+use crate::platform::amf_edc15p::egr::recommend_egr_delete_deltas;
+use crate::platform::amf_edc15p::envelope::CAPS;
 use crate::platform::amf_edc15p::PLATFORM_DISPLAY;
 use crate::recommend::engine::Recommendation;
 use crate::rules::base::{Finding, Severity};
 use crate::rules::runner::AnalysisResult;
+use crate::validate::ValidationReport;
 
 fn now_iso() -> String {
     Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
@@ -32,6 +35,16 @@ fn severity_rank(s: Severity) -> u8 {
 pub fn render_markdown(
     result: &AnalysisResult,
     recommendations: &[Recommendation],
+) -> String {
+    render_markdown_with_validation(result, recommendations, None)
+}
+
+/// Variant that appends an optional EGR-delete validation checklist
+/// section to the report.
+pub fn render_markdown_with_validation(
+    result: &AnalysisResult,
+    recommendations: &[Recommendation],
+    validation: Option<&ValidationReport>,
 ) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push("# ecu-shenanigans — Analysis report".to_string());
@@ -61,6 +74,37 @@ pub fn render_markdown(
         }
         lines.push(String::new());
     }
+
+    // ---- v3 EGR Delete Strategy section -------------------------------
+    lines.push("## EGR Delete Strategy (v3)".to_string());
+    lines.push(String::new());
+    lines.push(
+        "v3 mandates a software-only EGR delete. Hardware (EGR valve, cooler, \
+         vacuum lines, ASV) stays installed; the vacuum-actuated valve is \
+         held closed by its return spring with 0 % duty. The MAF/MAP smoke \
+         switch is **explicitly unchanged** — MAF stays the closed-loop \
+         smoke-limiter input (see spec §3.2)."
+            .to_string(),
+    );
+    lines.push(String::new());
+    lines.push("| Map | Cells | Action | Rationale |".to_string());
+    lines.push("|---|---|---|---|".to_string());
+    for d in recommend_egr_delete_deltas() {
+        let rationale = d.rationale.replace('\n', " ");
+        lines.push(format!(
+            "| `{}` | {} | {} | {} |",
+            d.map_name, d.cell_selector, d.action, rationale,
+        ));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "Hard envelope (v3): λ ≥ {}, peak IQ ≤ {} mg/stroke, EGR duty = {} %, \
+         spec-MAF ≥ {} mg/stroke, peak boost ≤ {} mbar, modelled torque ≤ {} Nm.",
+        CAPS.lambda_floor, CAPS.peak_iq_mg, CAPS.egr_duty_max_pct,
+        CAPS.spec_maf_fill_mg_stroke, CAPS.peak_boost_mbar_abs,
+        CAPS.modelled_flywheel_torque_nm,
+    ));
+    lines.push(String::new());
 
     if result.pulls.is_empty() {
         lines.push("## No WOT pulls detected".to_string());
@@ -142,6 +186,11 @@ pub fn render_markdown(
         for rid in &result.skipped_rules {
             lines.push(format!("- `{rid}`"));
         }
+        lines.push(String::new());
+    }
+
+    if let Some(report) = validation {
+        lines.push(report.to_markdown());
         lines.push(String::new());
     }
 

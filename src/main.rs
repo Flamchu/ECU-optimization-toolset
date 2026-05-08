@@ -11,6 +11,7 @@ use ecu_shenanigans::recommend::{recommend, write_report};
 use ecu_shenanigans::rules::analyse;
 use ecu_shenanigans::util::resample_to_uniform;
 use ecu_shenanigans::util::timebase::DEFAULT_RATE_HZ;
+use ecu_shenanigans::validate::validate_egr_delete;
 use ecu_shenanigans::VERSION;
 
 #[derive(Debug, Parser)]
@@ -35,6 +36,12 @@ enum Command {
         /// Output directory for the report.
         #[arg(long, default_value = "out")]
         out: PathBuf,
+    },
+    /// Run the v3 EGR-delete §7 validation checklist against a
+    /// post-flash log. Exits non-zero on any FAIL.
+    ValidateEgrDelete {
+        /// Post-flash VCDS `.csv` file path.
+        path: PathBuf,
     },
 }
 
@@ -90,5 +97,24 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
+        Command::ValidateEgrDelete { path } => match run_validate_egr_delete(&path) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::from(2),
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::from(1)
+            }
+        },
     }
+}
+
+fn run_validate_egr_delete(path: &std::path::Path) -> Result<bool, String> {
+    if !path.exists() {
+        return Err(format!("file not found: {}", path.display()));
+    }
+    eprintln!("validating EGR delete on {} ...", path.display());
+    let log = parse_vcds_csv(path).map_err(|e| e.to_string())?;
+    let report = validate_egr_delete(&log);
+    println!("{}", report.to_markdown());
+    Ok(report.pass())
 }
