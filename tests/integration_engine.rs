@@ -20,11 +20,9 @@ fn full_pipeline_on_overboost_fixture_emits_markdown() {
     let df = resample_to_uniform(&log, DEFAULT_RATE_HZ);
     let result = analyse(df, log);
     let recs = recommend(&result.findings);
-    let md = render_markdown(&result, &recs);
+    let md = render_markdown(&result, &recs, None);
     assert!(md.contains("ecu-shenanigans — Analysis report"));
-    assert!(md.contains("ecu-shenanigans"));
     assert!(md.contains("Recommendation table"));
-    // SVBL must always be present and skipped (leave stock).
     assert!(md.contains("`SVBL`"));
 }
 
@@ -36,7 +34,7 @@ fn full_pipeline_writes_report_file() {
     let df = resample_to_uniform(&log, DEFAULT_RATE_HZ);
     let result = analyse(df, log);
     let recs = recommend(&result.findings);
-    let path = write_report(&result, &recs, &tmp).expect("write report");
+    let path = write_report(&result, &recs, None, &tmp).expect("write report");
     assert!(path.exists(), "report file written: {}", path.display());
     let body = std::fs::read_to_string(&path).expect("read back");
     assert!(body.contains("Analysis report"));
@@ -62,6 +60,7 @@ fn recommendation_count_matches_default_deltas_table() {
     let result = analyse(df, log);
     let recs = recommend(&result.findings);
     assert_eq!(recs.len(), DEFAULT_DELTAS.len());
+    assert_eq!(recs.len(), 22);
 }
 
 #[test]
@@ -79,10 +78,24 @@ fn no_pull_log_renders_useful_message() {
         unmapped_columns: Vec::new(),
         warnings: Vec::new(),
         median_sample_dt_ms: 0.0,
+        dtcs: Vec::new(),
     };
     let df = ResampledLog { time: Vec::new(), data: BTreeMap::new() };
     let result = analyse(df, log);
     let recs = recommend(&result.findings);
-    let md = render_markdown(&result, &recs);
+    let md = render_markdown(&result, &recs, None);
     assert!(md.contains("No WOT pulls detected"));
+}
+
+#[test]
+fn render_markdown_with_validation_appends_checklist() {
+    use ecu_shenanigans::validate::validate_egr_delete;
+    let log = parse_vcds_csv(fixture("vcds_amf_post_delete.csv")).unwrap();
+    let df = resample_to_uniform(&log, DEFAULT_RATE_HZ);
+    let validation = validate_egr_delete(&log);
+    let result = analyse(df, log);
+    let recs = recommend(&result.findings);
+    let md = render_markdown(&result, &recs, Some(&validation));
+    assert!(md.contains("EGR Delete Validation Checklist"),
+        "validation checklist must be appended when supplied");
 }

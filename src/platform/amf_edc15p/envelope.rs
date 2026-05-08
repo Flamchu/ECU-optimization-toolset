@@ -441,6 +441,7 @@ mod tests {
         // v4 fix F + Y: pull-coolant minimum (80) and warm-cruise (70) split.
         assert!((CAPS.coolant_pull_min_c - 80.0).abs() < f64::EPSILON);
         assert!((CAPS.warm_coolant_min_c - 70.0).abs() < f64::EPSILON);
-        assert!(CAPS.coolant_pull_min_c > CAPS.warm_coolant_min_c);
+        // The relative ordering is also a compile-time invariant — see
+        // `_SELF_CONSISTENT` in tests/integration_envelope.rs.
     }
 }

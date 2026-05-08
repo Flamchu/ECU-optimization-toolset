@@ -44,7 +44,7 @@ fn report_contains_v3_required_sections() {
     let df = resample_to_uniform(&log, DEFAULT_RATE_HZ);
     let result = analyse(df, log);
     let recs = recommend(&result.findings);
-    let md = render_markdown(&result, &recs);
+    let md = render_markdown(&result, &recs, None);
 
     // Spec §13 acceptance #1: required sections.
     assert!(md.contains("EGR Delete Strategy"),

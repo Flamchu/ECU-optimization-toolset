@@ -1,0 +1,2 @@
+# Pre-EGR-delete DTC scan — captured BEFORE the software delete was flashed
+P0401   EGR insufficient flow

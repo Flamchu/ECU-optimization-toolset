@@ -34,12 +34,26 @@ proptest! {
     }
 
     #[test]
-    fn soi_clamp_never_exceeds_cap(
+    fn soi_clamp_caps_at_high_iq(
         proposed in finite_f64(),
-        iq in 0.0_f64..80.0,
+        iq in CAPS.soi_iq_threshold_mg..80.0,
     ) {
         let r = clamp_soi(proposed, iq);
-        prop_assert!(r.value <= CAPS.soi_max_btdc + 1e-9);
+        prop_assert!(r.value <= CAPS.soi_max_btdc + 1e-9,
+            "at IQ ≥ {}, SOI must cap to {}",
+            CAPS.soi_iq_threshold_mg, CAPS.soi_max_btdc);
+    }
+
+    #[test]
+    fn soi_clamp_passes_through_at_low_iq(
+        proposed in 0.0_f64..40.0,
+        iq in 0.0_f64..(CAPS.soi_iq_threshold_mg - 1e-3),
+    ) {
+        // v4 fix I: at IQ below threshold, clamp_soi returns the proposed
+        // value unchanged (cruise / cold maps run more advanced).
+        let r = clamp_soi(proposed, iq);
+        prop_assert!(!r.blocked);
+        prop_assert!((r.value - proposed).abs() < 1e-12);
     }
 
     #[test]
@@ -85,4 +99,7 @@ const _SELF_CONSISTENT: () = {
     assert!(CAPS.peak_boost_above_4000rpm_mbar_abs <= CAPS.peak_boost_mbar_abs,
         "above-4000 cap must be tighter or equal to the global cap");
     assert!(CAPS.eoi_max_atdc > 0.0, "EOI cap must be positive");
+    assert!(CAPS.coolant_pull_min_c >= CAPS.warm_coolant_min_c,
+        "coolant pull-min must be ≥ warm-cruise/idle min");
+    assert!(CAPS.lambda_floor == 1.05, "v4 lambda floor unified at 1.05");
 };
