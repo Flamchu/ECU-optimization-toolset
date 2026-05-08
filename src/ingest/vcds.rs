@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::ingest::canonicalize::{build_column_map, groups_present};
+use crate::ingest::dtc;
 use crate::platform::amf_edc15p::channels::MIN_REQUIRED_GROUPS;
 
 /// One soft warning surfaced from the parser.
@@ -59,6 +60,10 @@ pub struct VcdsLog {
     pub warnings: Vec<ParseWarning>,
     /// Median sample interval in milliseconds.
     pub median_sample_dt_ms: f64,
+    /// DTCs from a sidecar `.dtc.txt` scan file, if loaded. Empty means
+    /// either no sidecar was present, or no DTCs were captured. R19 and
+    /// the EGR-delete checklist read this list.
+    pub dtcs: Vec<String>,
 }
 
 impl VcdsLog {
@@ -176,12 +181,34 @@ fn split_rows(text: &str, delimiter: char) -> Vec<Vec<String>> {
 // Public entry point
 // ---------------------------------------------------------------------------
 
-/// Parse a VCDS `.csv` export at `path`.
+/// Parse a VCDS `.csv` export at `path`. Auto-loads `<base>.dtc.txt`
+/// alongside if present (silent if not).
 pub fn parse_vcds_csv<P: AsRef<Path>>(path: P) -> Result<VcdsLog> {
     let p = path.as_ref().to_path_buf();
     let raw = std::fs::read_to_string(&p)
         .map_err(|e| Error::Io { path: p.clone(), source: e })?;
-    parse_vcds_str(&p, &raw)
+    let mut log = parse_vcds_str(&p, &raw)?;
+    // Auto-load conventional sidecar.
+    let sidecar = dtc::sidecar_path_for(&p);
+    if let Ok(codes) = dtc::read_sidecar(&sidecar) {
+        log.dtcs = codes;
+    }
+    Ok(log)
+}
+
+/// Parse a VCDS `.csv` and an explicit DTC sidecar path (overrides the
+/// conventional `<base>.dtc.txt` lookup). Use this when the operator
+/// passes `--dtc <FILE>` on the CLI.
+pub fn parse_vcds_csv_with_dtc<P: AsRef<Path>, D: AsRef<Path>>(
+    csv: P,
+    dtc_path: D,
+) -> Result<VcdsLog> {
+    let p = csv.as_ref().to_path_buf();
+    let raw = std::fs::read_to_string(&p)
+        .map_err(|e| Error::Io { path: p.clone(), source: e })?;
+    let mut log = parse_vcds_str(&p, &raw)?;
+    log.dtcs = dtc::read_sidecar(&dtc_path).unwrap_or_default();
+    Ok(log)
 }
 
 /// Variant of [`parse_vcds_csv`] for in-memory text.
@@ -303,6 +330,7 @@ pub fn parse_vcds_str(path: &Path, raw: &str) -> Result<VcdsLog> {
         unmapped_columns: unmapped,
         warnings: Vec::new(),
         median_sample_dt_ms: median_dt_ms,
+        dtcs: Vec::new(),
     };
     if log.low_rate() {
         warnings.push(ParseWarning {

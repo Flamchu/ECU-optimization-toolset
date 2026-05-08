@@ -33,6 +33,12 @@ const GF_TO_CANONICAL: &[(&str, &str)] = &[
     ("008-2", "iq_requested"),
     ("008-3", "iq_limit_rpm"),
     ("008-4", "iq_limit_maf"),
+    // 002 — driver wish (pedal % surfaces here on some firmwares)
+    ("002-3", "pedal_pct"),
+    // 005 — engine speed / load / road speed / op status
+    ("005-1", "rpm"),
+    ("005-2", "load_pct"),
+    ("005-3", "vehicle_speed"),
     // 010 — MAF + ambient + TPS
     ("010-1", "maf_for_atm"),
     ("010-2", "atm_pressure"),

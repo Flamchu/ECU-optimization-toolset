@@ -1,4 +1,4 @@
-//! Canonical channel registry for AMF / EDC15P+ via VCDS (spec §8).
+//! Canonical channel registry for AMF / EDC15P+ via VCDS (spec §5, v4).
 //!
 //! Every downstream module refers to channels by the snake_case names
 //! below. The VCDS canonicalizer translates `NNN-K` headers into these
@@ -6,6 +6,10 @@
 //!
 //! Modelled-not-measured channels (lambda, EGT) live in helpers that
 //! the rules call explicitly — they are not part of this registry.
+//!
+//! DTCs are NOT a channel — they come from a separate VCDS DTC scan
+//! (sidecar file, `<base>.dtc.txt`) and are stored as `Vec<String>` on
+//! the parsed log. See [`crate::ingest::dtc`].
 
 /// One canonical channel definition.
 #[derive(Debug, Clone, Copy)]
@@ -20,7 +24,7 @@ pub struct Channel {
     pub description: &'static str,
 }
 
-/// Complete channel registry for AMF / EDC15P+.
+/// Complete channel registry for AMF / EDC15P+ (v4).
 pub const CHANNELS: &[Channel] = &[
     Channel { name: "rpm",            source: "001-1|003-1|008-1|011-1|020-1", unit: "rpm",       description: "engine speed (any group)" },
     Channel { name: "iq_actual",      source: "001-2",                          unit: "mg/stroke", description: "idle/cruise IQ — NOT WOT IQ" },
@@ -36,7 +40,8 @@ pub const CHANNELS: &[Channel] = &[
     Channel { name: "boost_actual",   source: "011-3",                          unit: "mbar abs",  description: "PID-controlled actual" },
     Channel { name: "n75_duty",       source: "011-4",                          unit: "%",         description: "boost actuator drive" },
     Channel { name: "atm_pressure",   source: "010-2",                          unit: "mbar abs",  description: "ambient — capture key-on/engine-off" },
-    Channel { name: "tps_pct",        source: "010-3",                          unit: "%",         description: "throttle/pedal proxy" },
+    Channel { name: "pedal_pct",      source: "002-?|003-3-pedal",              unit: "%",         description: "driver-wish pedal % — used for WOT detection (≥ pedal_wot_pct) and R17 cruise filter" },
+    Channel { name: "tps_pct",        source: "010-3",                          unit: "%",         description: "throttle/anti-shudder valve % — diesel anti-shudder valve, NOT a driver-pedal proxy" },
     Channel { name: "soi_actual",     source: "020-2",                          unit: "deg BTDC",  description: "logged start-of-injection" },
     Channel { name: "map_abs",        source: "020-3",                          unit: "mbar abs",  description: "MAP cross-check vs 011-3" },
     Channel { name: "load_pct",       source: "020-4",                          unit: "%",         description: "engine load" },
@@ -45,9 +50,9 @@ pub const CHANNELS: &[Channel] = &[
     Channel { name: "srcv_cyl1",      source: "013-1",                          unit: "mg/stroke", description: "smooth-running cyl 1" },
     Channel { name: "srcv_cyl2",      source: "013-2",                          unit: "mg/stroke", description: "smooth-running cyl 2" },
     Channel { name: "srcv_cyl3",      source: "013-3",                          unit: "mg/stroke", description: "smooth-running cyl 3 (AMF is 3-cyl)" },
-    Channel { name: "fuel_temp_c",    source: "013-?",                          unit: "C",         description: "fuel temp on firmwares that expose it" },
-    Channel { name: "vehicle_speed",  source: "004-?",                          unit: "km/h",      description: "VSS for cruise / idle distinction" },
-    Channel { name: "dtc_codes",      source: "OBD scan",                       unit: "code",      description: "DTC strings (post-flash validation, R19)" },
+    Channel { name: "fuel_temp_c",    source: "013-4|015-?",                    unit: "C",         description: "fuel temp on firmwares that expose it" },
+    Channel { name: "vehicle_speed",  source: "005-3",                          unit: "km/h",      description: "VSS for cruise / idle distinction (group 005, field 3 — corrected from misnumbered 004)" },
+    Channel { name: "coolant_demand_c", source: "007-?",                        unit: "C",         description: "coolant temperature setpoint (where exposed)" },
 ];
 
 /// Channels we explicitly do not log (no factory sensor / not on KW1281).
@@ -59,7 +64,7 @@ pub const NOT_LOGGED: &[&str] = &[
     "injector_duty",
 ];
 
-/// Required minimum groups for any pull analysis to run (spec §6.2).
+/// Required minimum groups for any pull analysis to run.
 pub const MIN_REQUIRED_GROUPS: &[&str] = &["003", "008", "011"];
 
 /// Look up a channel definition by its canonical name.
@@ -97,5 +102,29 @@ mod tests {
         let original = seen.len();
         seen.dedup();
         assert_eq!(original, seen.len(), "duplicate channel name in registry");
+    }
+
+    #[test]
+    fn vehicle_speed_sourced_from_group_005() {
+        // v4 fix K: VSS lives in group 005 on PD-family EDC15P+, not 004.
+        let vss = channel("vehicle_speed").expect("vehicle_speed must exist");
+        assert!(vss.source.starts_with("005-"),
+            "vehicle_speed source must be group 005, got: {}", vss.source);
+    }
+
+    #[test]
+    fn pedal_pct_is_separate_from_tps_pct() {
+        // v4 fix G: pedal_pct is the canonical driver-wish channel; tps_pct
+        // is the diesel anti-shudder valve.
+        assert!(channel("pedal_pct").is_some());
+        assert!(channel("tps_pct").is_some());
+        assert!(channel("tps_pct").unwrap().description.contains("anti-shudder"));
+    }
+
+    #[test]
+    fn dtc_codes_channel_is_removed() {
+        // v4 fix J: DTCs are no longer encoded as a synthetic float channel.
+        // They live in a sidecar file parsed by ingest::dtc.
+        assert!(channel("dtc_codes").is_none());
     }
 }
