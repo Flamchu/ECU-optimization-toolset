@@ -21,6 +21,14 @@ pub enum DeltaKind {
     ExtendAxis,
     /// Clamp the peak of the surface to a fixed value (or via lambda model).
     ClampPeak,
+    /// v3: zero an EGR-related map (force every cell to 0 % duty).
+    ZeroEgr,
+    /// v3: fill a spec-MAF cell range to the Strategy-B saturation
+    /// value (default 850 mg/stroke).
+    FillSpecMaf,
+    /// v3: widen / disable a DTC plausibility threshold so it cannot
+    /// trip after the EGR delete.
+    SuppressDtc,
 }
 
 /// One row in the default sane-deltas table.
@@ -137,6 +145,60 @@ pub const DEFAULT_DELTAS: &[DefaultDelta] = &[
         value: None,
         rule_refs: &["R05"],
         note: "Leave stock unless MAF replaced or drift > 10 %.",
+    },
+    // ---- v3 EGR-delete additions ----------------------------------------
+    DefaultDelta {
+        map_name: "AGR_arwMEAB0KL",
+        cell_selector: "all cells, both banks",
+        kind: DeltaKind::ZeroEgr,
+        value: Some(0.0),
+        rule_refs: &[],
+        note: "v3 mandate: software EGR delete. EGR duty = 0% across the entire \
+               (rpm, IQ, T_coolant, atm) domain. Hardware stays installed.",
+    },
+    DefaultDelta {
+        map_name: "arwMLGRDKF",
+        cell_selector: "all cells, both banks",
+        kind: DeltaKind::FillSpecMaf,
+        value: Some(850.0),
+        rule_refs: &[],
+        note: "v3 mandate: spec-MAF saturated at 850 mg/stroke (Strategy B). \
+               Belt-and-braces with the EGR-duty zero so the PID never demands EGR.",
+    },
+    DefaultDelta {
+        map_name: "DTC_thresholds",
+        cell_selector: "P0401, P0402, P0403, P0404, P0405, P0406",
+        kind: DeltaKind::SuppressDtc,
+        value: None,
+        rule_refs: &[],
+        note: "v3 controlled-environment context: widen MAF-deviation thresholds and \
+               time-debounce so emissions DTCs cannot trip after the delete. P0403 \
+               still detects real solenoid wiring faults.",
+    },
+    DefaultDelta {
+        map_name: "MAF_MAP_smoke_switch",
+        cell_selector: "0x51C30 / 0x71C30",
+        kind: DeltaKind::LeaveStock,
+        value: None,
+        rule_refs: &[],
+        note: "v3 explicitly keeps MAF closed-loop (see spec §3.2). Switch stays at 0x00.",
+    },
+    DefaultDelta {
+        map_name: "Idle_fuel",
+        cell_selector: "warm idle (T_coolant ≥ 80°C, IQ ≤ 8 mg)",
+        kind: DeltaKind::DeltaMg,
+        value: Some(-1.5),
+        rule_refs: &["R12"],
+        note: "Conditional: −1.5 mg/stroke at idle ONLY if R12 fires (RPM σ > 25 over 30 s).",
+    },
+    DefaultDelta {
+        map_name: "SOI_warm_cruise",
+        cell_selector: "1500-2500 rpm × 5-15 mg, SOI maps 0..3 (warm)",
+        kind: DeltaKind::DeltaDeg,
+        value: Some(-1.0),
+        rule_refs: &["R18"],
+        note: "Cruise-band NVH retard (−1.0° BTDC). EGR-off has a faster premixed phase. \
+               Cold-start SOI maps 4..9 untouched.",
     },
 ];
 

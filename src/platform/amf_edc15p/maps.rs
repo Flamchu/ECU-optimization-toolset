@@ -130,6 +130,49 @@ pub const MAPS: &[MapDef] = &[
         cell_unit: "C", typical_dim: "varies",
         description: "EGT model / fuel cut on temp (where present). DO NOT RAISE — used as backstop.",
     },
+    // ---- v3 EGR-delete-specific symbolic maps ---------------------------
+    MapDef {
+        name: "AGR_arwMEAB0KL",
+        german_alias: "Abgasrückführung Tastverhältnis",
+        x_axis: "rpm", y_axis: "iq_mg",
+        cell_unit: "% duty", typical_dim: "13x16",
+        description: "EGR-duty map (AGR). v3 mandate: zero all cells in both banks.",
+    },
+    MapDef {
+        name: "arwMLGRDKF",
+        german_alias: "Sollluftmasse / EGR target air mass",
+        x_axis: "rpm", y_axis: "iq_mg",
+        cell_unit: "mg/stroke", typical_dim: "16x10",
+        description: "Spec-MAF / expected air mass. v3 mandate: fill ≥850 mg/stroke (Strategy B).",
+    },
+    MapDef {
+        name: "DTC_thresholds",
+        german_alias: "DTC-Grenzwerte",
+        x_axis: "dtc_id", y_axis: "_",
+        cell_unit: "mg/s · ms", typical_dim: "varies",
+        description: "DTC plausibility thresholds and time-debounce for P0401..P0406.",
+    },
+    MapDef {
+        name: "MAF_MAP_smoke_switch",
+        german_alias: "Rauchbegrenzung-Quelle (MAF/MAP)",
+        x_axis: "scalar", y_axis: "scalar",
+        cell_unit: "byte", typical_dim: "1x1",
+        description: "Smoke-limiter source switch. 0x00 = MAF-based (v3 LEAVE STOCK).",
+    },
+    MapDef {
+        name: "Idle_fuel",
+        german_alias: "Leerlauf-Mengenkennfeld (Slice)",
+        x_axis: "rpm", y_axis: "iq_mg",
+        cell_unit: "mg/stroke", typical_dim: "varies",
+        description: "Idle fuelling slice. CONDITIONAL: trim only if R12 fires post-delete.",
+    },
+    MapDef {
+        name: "SOI_warm_cruise",
+        german_alias: "Spritzbeginn warm (Cruise-Band)",
+        x_axis: "rpm", y_axis: "iq_mg",
+        cell_unit: "deg BTDC", typical_dim: "10x16",
+        description: "Warm-cruise SOI band (1500-2500 rpm × 5-15 mg). v3: −1.0° NVH retard.",
+    },
 ];
 
 /// Look up a map by its canonical short id.
@@ -142,8 +185,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_fifteen_maps() {
-        assert_eq!(MAPS.len(), 15);
+    fn registry_has_v3_maps() {
+        // 15 v2 maps + 6 v3 EGR-delete-specific maps.
+        assert_eq!(MAPS.len(), 21);
+    }
+
+    #[test]
+    fn v3_egr_maps_are_present() {
+        for name in [
+            "AGR_arwMEAB0KL",
+            "arwMLGRDKF",
+            "DTC_thresholds",
+            "MAF_MAP_smoke_switch",
+            "Idle_fuel",
+            "SOI_warm_cruise",
+        ] {
+            assert!(get_map(name).is_some(), "v3 map {name} must be in registry");
+        }
     }
 
     #[test]

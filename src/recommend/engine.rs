@@ -14,8 +14,8 @@ use std::collections::BTreeSet;
 
 use crate::platform::amf_edc15p::default_deltas::{DefaultDelta, DeltaKind, DEFAULT_DELTAS};
 use crate::platform::amf_edc15p::envelope::{
-    clamp_boost_target, clamp_iq, clamp_soi, clamp_svbl, clamp_torque_nm,
-    ClampOutcome, CAPS,
+    clamp_boost_target, clamp_egr_duty_pct, clamp_iq, clamp_soi, clamp_spec_maf,
+    clamp_svbl, clamp_torque_nm, ClampOutcome, CAPS,
 };
 use crate::platform::amf_edc15p::stock_refs::stock_boost_at_rpm;
 use crate::rules::base::{Finding, Severity};
@@ -215,6 +215,46 @@ fn eval_default(d: &DefaultDelta, firing: &BTreeSet<String>) -> Recommendation {
                 rule_refs: rule_refs_vec(d), blocked_cap: cap,
             }
         }
+        (DeltaKind::ZeroEgr, _) => {
+            // Mandatory v3: always emit APPLY. Run the proposed 0 % through
+            // clamp_egr_duty_pct so any future caller passing a non-zero
+            // value would still be blocked.
+            let outcome = clamp_egr_duty_pct(0.0);
+            let (text, status, cap, extra) = formatted(&outcome, "set all cells to 0 % duty");
+            Recommendation {
+                map_name: d.map_name.to_string(),
+                cell_selector: d.cell_selector.to_string(),
+                status, proposed_value_text: text,
+                rationale: rationale_with_cap(d.note, &extra),
+                rule_refs: rule_refs_vec(d), blocked_cap: cap,
+            }
+        }
+        (DeltaKind::FillSpecMaf, value) => {
+            let fill = value.unwrap_or(CAPS.spec_maf_fill_mg_stroke);
+            let outcome = clamp_spec_maf(fill);
+            let (text, status, cap, extra) = formatted(
+                &outcome, &format!("fill all cells with {fill:.0} mg/stroke"),
+            );
+            Recommendation {
+                map_name: d.map_name.to_string(),
+                cell_selector: d.cell_selector.to_string(),
+                status, proposed_value_text: text,
+                rationale: rationale_with_cap(d.note, &extra),
+                rule_refs: rule_refs_vec(d), blocked_cap: cap,
+            }
+        }
+        (DeltaKind::SuppressDtc, _) => {
+            // Symbolic only — no numeric clamp. Always APPLY in v3.
+            Recommendation {
+                map_name: d.map_name.to_string(),
+                cell_selector: d.cell_selector.to_string(),
+                status: Status::Apply,
+                proposed_value_text: "widen thresholds / disable enable-flag".to_string(),
+                rationale: d.note.to_string(),
+                rule_refs: rule_refs_vec(d),
+                blocked_cap: None,
+            }
+        }
         _ => Recommendation {
             map_name: d.map_name.to_string(),
             cell_selector: d.cell_selector.to_string(),
@@ -270,11 +310,27 @@ mod tests {
     }
 
     #[test]
-    fn no_findings_yields_all_skips_or_unconditional_apply() {
+    fn no_findings_skips_conditional_rows_but_applies_egr_mandate() {
         let recs = recommend(&[]);
+        // Rows with rule_refs need a triggering rule → all SKIP without findings.
         for r in &recs {
-            assert!(matches!(r.status, Status::Skip));
+            if !r.rule_refs.is_empty() {
+                assert!(matches!(r.status, Status::Skip),
+                    "{} should SKIP without firing rule", r.map_name);
+            }
         }
+        // The unconditional v3 EGR-delete mandate ALWAYS applies, regardless
+        // of findings (it is the v3 thesis).
+        let egr = recs.iter().find(|r| r.map_name == "AGR_arwMEAB0KL").unwrap();
+        assert_eq!(egr.status, Status::Apply);
+        let spec = recs.iter().find(|r| r.map_name == "arwMLGRDKF").unwrap();
+        assert_eq!(spec.status, Status::Apply);
+        let dtc = recs.iter().find(|r| r.map_name == "DTC_thresholds").unwrap();
+        assert_eq!(dtc.status, Status::Apply);
+        // The MAF/MAP switch is explicitly LEAVE STOCK regardless of evidence.
+        let sw = recs.iter().find(|r| r.map_name == "MAF_MAP_smoke_switch").unwrap();
+        assert_eq!(sw.status, Status::Skip);
+        assert_eq!(sw.proposed_value_text, "leave stock");
     }
 
     #[test]
