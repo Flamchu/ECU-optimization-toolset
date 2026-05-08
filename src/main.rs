@@ -1,4 +1,4 @@
-//! `ecu-shenanigans` CLI (v4) — analyse VCDS logs, validate EGR delete,
+//! `ecu-shenanigans` CLI — analyse VCDS logs, validate EGR delete,
 //! emit a Markdown report.
 
 use std::path::PathBuf;
@@ -115,7 +115,7 @@ fn run_analyse(
     }
     if inputs.len() > 1 {
         eprintln!(
-            "note: {} input(s) supplied; v4 analyses the first ({}) — multi-bundle merge is \
+            "note: {} input(s) supplied; analysing the first ({}) — multi-bundle merge is \
              a future extension. Other inputs were ignored.",
             inputs.len(),
             primary.display(),

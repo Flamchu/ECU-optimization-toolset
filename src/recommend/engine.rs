@@ -1,4 +1,4 @@
-//! Recommendation engine (v4).
+//! Recommendation engine.
 //!
 //! Joins findings with the default-deltas table and runs every emitted
 //! delta through the envelope clamper before emitting it.
@@ -220,7 +220,7 @@ fn eval_default(d: &DefaultDelta, firing: &BTreeSet<String>) -> Recommendation {
             }
         }
         (DeltaKind::ZeroEgr, _) => {
-            // Mandatory v4: always emit APPLY. Run the proposed 0 % through
+            // Mandatory: always emit APPLY. Run the proposed 0 % through
             // clamp_egr_duty_pct so any future caller passing a non-zero
             // value would still be blocked.
             let outcome = clamp_egr_duty_pct(0.0);
@@ -393,7 +393,7 @@ mod tests {
                     "{} should SKIP without firing rule", r.map_name);
             }
         }
-        // The unconditional v4 EGR-delete mandate ALWAYS applies.
+        // The unconditional EGR-delete mandate ALWAYS applies.
         let bank_a = recs.iter().find(|r| r.map_name == "AGR_arwMEAB0KL").unwrap();
         assert_eq!(bank_a.status, Status::Apply);
         let bank_b = recs.iter().find(|r| r.map_name == "AGR_arwMEAB1KL").unwrap();
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn engine_emits_both_egr_banks() {
-        // v4 fix W: the bank-pair contract — one row per bank.
+        // Bank-pair contract: one row per bank.
         let recs = recommend(&[]);
         let banks: Vec<&str> = recs.iter()
             .filter(|r| r.map_name.starts_with("AGR_arwMEAB"))
@@ -500,7 +500,7 @@ mod tests {
 
     #[test]
     fn smoke_rows_render_lambda_floor_from_caps() {
-        // v4 acceptance #4: the rendered λ value is the CAPS const.
+        // The rendered λ value is the CAPS const (cross-link audit).
         let recs = recommend(&[finding("R06", Severity::Critical)]);
         let smoke = recs.iter().find(|r| r.map_name == "Smoke_IQ_by_MAF").unwrap();
         assert!(smoke.proposed_value_text.contains(&format!("{}", CAPS.lambda_floor)));

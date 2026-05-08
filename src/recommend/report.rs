@@ -1,4 +1,4 @@
-//! Markdown report writer (v4).
+//! Markdown report writer.
 
 use std::fs;
 use std::io;
@@ -31,9 +31,9 @@ fn severity_rank(s: Severity) -> u8 {
     match s { Severity::Critical => 2, Severity::Warn => 1, Severity::Info => 0 }
 }
 
-/// Render the full Markdown report to a string. v4 single signature: an
-/// optional [`ValidationReport`] is appended as a Markdown subsection
-/// when supplied (CLI `--validate`).
+/// Render the full Markdown report to a string. An optional
+/// [`ValidationReport`] is appended as a Markdown subsection when
+/// supplied (CLI `--validate`).
 pub fn render_markdown(
     result: &AnalysisResult,
     recommendations: &[Recommendation],
@@ -73,14 +73,14 @@ pub fn render_markdown(
     }
 
     // ---- EGR Delete Strategy section ----------------------------------
-    lines.push("## EGR Delete Strategy (v4)".to_string());
+    lines.push("## EGR Delete Strategy".to_string());
     lines.push(String::new());
     lines.push(
-        "v4 mandates a software-only EGR delete. Hardware (EGR valve, cooler, \
+        "Software-only EGR delete is mandatory. Hardware (EGR valve, cooler, \
          vacuum lines, ASV) stays installed; the vacuum-actuated valve is \
          held closed by its return spring with 0 % duty in both banks of \
          the AGR map. The MAF/MAP smoke switch is **explicitly unchanged** — \
-         MAF stays the closed-loop smoke-limiter input (see spec §3.2)."
+         MAF stays the closed-loop smoke-limiter input."
             .to_string(),
     );
     lines.push(String::new());
@@ -95,7 +95,7 @@ pub fn render_markdown(
     }
     lines.push(String::new());
     lines.push(format!(
-        "Hard envelope (v4): λ ≥ {}, peak IQ ≤ {} mg/stroke, EGR duty = {} %, \
+        "Hard envelope: λ ≥ {}, peak IQ ≤ {} mg/stroke, EGR duty = {} %, \
          spec-MAF ≥ {} mg/stroke, peak boost ≤ {} mbar (≤ {} above 4000 rpm), \
          modelled torque ≤ {} Nm, SOI ≤ {}° BTDC at IQ ≥ {} mg, EOI ≤ {}° ATDC, \
          coolant pull-min {} °C, warm-cruise/idle min {} °C.",
