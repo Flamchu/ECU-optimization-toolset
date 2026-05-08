@@ -18,6 +18,7 @@ pub mod platform;
 pub mod recommend;
 pub mod rules;
 pub mod util;
+pub mod validate;
 
 /// Library version, kept in sync with `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
