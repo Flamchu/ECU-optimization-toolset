@@ -1,0 +1,39 @@
+# --- Rust / Cargo -----------------------------------------------------------
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo lock is committed (binary crate) — leave Cargo.lock tracked.
+
+# --- IDE / editor -----------------------------------------------------------
+/.vscode/
+/.idea/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Tool output ------------------------------------------------------------
+/out/
+/reports/
+*.log
+*.tmp
+
+# --- Local environment ------------------------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Coverage / profiling ---------------------------------------------------
+/coverage/
+*.profraw
+*.profdata
+tarpaulin-report.html
+cobertura.xml
+
+# --- Local fixtures generated during dev ------------------------------------
+# (Do NOT ignore tests/fixtures/*.csv — those are checked in.)
+/scratch/
+/tmp/
