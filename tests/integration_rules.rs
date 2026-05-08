@@ -8,6 +8,8 @@ use ecu_shenanigans::rules::pack::{
     r05_maf_below_spec, r06_lambda_floor, r07_peak_iq, r08_torque_ceiling,
     r09_soi_excess, r10_eoi_late, r11_coolant_low, r12_no_atm,
     r13_fuel_temp, r14_srcv, r15_limp,
+    r16_egr_observed, r17_maf_deviation, r17b_maf_excess_info,
+    r18_cruise_nvh, r19_dtc_scan,
 };
 use ecu_shenanigans::util::{Pull, ResampledLog};
 
@@ -102,12 +104,31 @@ fn r06_fires_when_lambda_below_floor() {
 }
 
 #[test]
-fn r07_fires_when_iq_above_envelope() {
-    let iq = vec![55.0; N];
+fn r07_fires_when_iq_above_v3_envelope() {
+    let iq = vec![56.0; N];
     let log = log_from(&[("iq_requested", iq)]);
     let f = r07_peak_iq(&log, &full_pull());
     assert_eq!(f.len(), 1);
-    assert!(f[0].observed_extreme > 52.0);
+    assert!(f[0].observed_extreme > 54.0);
+}
+
+#[test]
+fn r07_quiet_at_v2_old_threshold() {
+    // 53 mg/stroke would have tripped v2 (cap=52) but is fine in v3 (cap=54).
+    let iq = vec![53.0; N];
+    let log = log_from(&[("iq_requested", iq)]);
+    let f = r07_peak_iq(&log, &full_pull());
+    assert!(f.is_empty());
+}
+
+#[test]
+fn r06_quiet_at_v2_lambda_floor() {
+    // λ ≈ 1.10 was a v2 critical; v3 floor is 1.05 so it should pass.
+    let maf = vec![1100.0; N];
+    let iq = vec![69.0; N]; // λ ≈ 1100 / (69 * 14.5) ≈ 1.099
+    let log = log_from(&[("maf_actual", maf), ("iq_requested", iq)]);
+    let f = r06_lambda_floor(&log, &full_pull());
+    assert!(f.is_empty(), "λ ≈ 1.10 should be allowed in v3");
 }
 
 #[test]
@@ -204,5 +225,159 @@ fn r15_quiet_when_n75_modulates() {
     }
     let log = log_from(&[("n75_duty", n75)]);
     let f = r15_limp(&log, &full_pull());
+    assert!(f.is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// v3 EGR-delete rule tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r16_fires_when_egr_observed_post_delete() {
+    let mut duty = vec![0.0; N];
+    duty[10] = 35.0; // delete clearly not applied
+    let log = log_from(&[("egr_duty", duty)]);
+    let f = r16_egr_observed(&log, &full_pull());
+    assert_eq!(f.len(), 1);
+    assert_eq!(f[0].severity, Severity::Critical);
+    assert!(f[0].observed_extreme > 30.0);
+}
+
+#[test]
+fn r16_quiet_when_egr_zero() {
+    let log = log_from(&[("egr_duty", vec![0.5; N])]); // sensor noise
+    let f = r16_egr_observed(&log, &full_pull());
+    assert!(f.is_empty());
+}
+
+#[test]
+fn r16_skipped_when_channel_missing() {
+    let log = log_from(&[("rpm", rpm_ramp())]);
+    let f = r16_egr_observed(&log, &full_pull());
+    assert!(f.iter().any(|x| x.skipped));
+}
+
+#[test]
+fn r17_fires_on_sustained_maf_deviation() {
+    let actual = vec![100.0; N]; // 80% deviation, sustained
+    let spec = vec![500.0; N];
+    let coolant = vec![85.0; N];
+    let pedal = vec![25.0; N]; // cruise, not WOT
+    let log = log_from(&[
+        ("maf_actual", actual), ("maf_spec", spec),
+        ("coolant_c", coolant), ("tps_pct", pedal),
+    ]);
+    let f = r17_maf_deviation(&log, &full_pull());
+    assert_eq!(f.len(), 1);
+    assert_eq!(f[0].severity, Severity::Warn);
+}
+
+#[test]
+fn r17_excludes_wot_samples() {
+    let actual = vec![100.0; N];
+    let spec = vec![500.0; N];
+    let coolant = vec![85.0; N];
+    let pedal = vec![95.0; N]; // WOT — exclude
+    let log = log_from(&[
+        ("maf_actual", actual), ("maf_spec", spec),
+        ("coolant_c", coolant), ("tps_pct", pedal),
+    ]);
+    let f = r17_maf_deviation(&log, &full_pull());
+    assert!(f.is_empty(), "WOT samples must be excluded from R17");
+}
+
+#[test]
+fn r17_excludes_cold_start_samples() {
+    let actual = vec![100.0; N];
+    let spec = vec![500.0; N];
+    let coolant = vec![40.0; N]; // cold — exclude
+    let pedal = vec![25.0; N];
+    let log = log_from(&[
+        ("maf_actual", actual), ("maf_spec", spec),
+        ("coolant_c", coolant), ("tps_pct", pedal),
+    ]);
+    let f = r17_maf_deviation(&log, &full_pull());
+    assert!(f.is_empty(), "cold-start samples must be excluded from R17");
+}
+
+#[test]
+fn r17b_fires_when_maf_exceeds_spec_with_egr_zero() {
+    // Strategy-B post-delete: spec saturated at 850, MAF actual at 350-650.
+    // We need actual > spec + 50, so spec must be <300 for any chance.
+    // Realistic Strategy-A re-scaled spec: spec=200, actual=300 → excess 100.
+    let actual = vec![300.0; N];
+    let spec = vec![200.0; N];
+    let egr = vec![0.0; N];
+    let log = log_from(&[
+        ("maf_actual", actual), ("maf_spec", spec), ("egr_duty", egr),
+    ]);
+    let f = r17b_maf_excess_info(&log, &full_pull());
+    assert_eq!(f.len(), 1);
+    assert_eq!(f[0].severity, Severity::Info);
+}
+
+#[test]
+fn r17b_silent_when_egr_active() {
+    let actual = vec![300.0; N];
+    let spec = vec![200.0; N];
+    let egr = vec![25.0; N]; // EGR active — don't claim "delete functional"
+    let log = log_from(&[
+        ("maf_actual", actual), ("maf_spec", spec), ("egr_duty", egr),
+    ]);
+    let f = r17b_maf_excess_info(&log, &full_pull());
+    assert!(f.is_empty());
+}
+
+#[test]
+fn r18_fires_at_warm_cruise_with_stock_soi_and_egr_zero() {
+    let n = N;
+    let rpm = vec![2000.0; n];
+    let iq = vec![10.0; n];
+    let soi = vec![20.0; n]; // > 18° BTDC stock cruise
+    let egr = vec![0.0; n];
+    let coolant = vec![85.0; n];
+    let pedal = vec![20.0; n];
+    let log = log_from(&[
+        ("rpm", rpm), ("iq_requested", iq), ("soi_actual", soi),
+        ("egr_duty", egr), ("coolant_c", coolant), ("tps_pct", pedal),
+    ]);
+    let f = r18_cruise_nvh(&log, &full_pull());
+    assert_eq!(f.len(), 1);
+    assert_eq!(f[0].severity, Severity::Info);
+}
+
+#[test]
+fn r18_quiet_outside_cruise_band() {
+    let n = N;
+    let rpm = vec![3500.0; n]; // outside cruise band
+    let iq = vec![10.0; n];
+    let soi = vec![20.0; n];
+    let egr = vec![0.0; n];
+    let log = log_from(&[
+        ("rpm", rpm), ("iq_requested", iq), ("soi_actual", soi), ("egr_duty", egr),
+    ]);
+    let f = r18_cruise_nvh(&log, &full_pull());
+    assert!(f.is_empty());
+}
+
+#[test]
+fn r19_fires_on_egr_dtcs() {
+    // Encode P0401 as 401, P0403 as 403 in the dtc_codes channel.
+    let mut dtc = vec![f64::NAN; N];
+    dtc[5] = 401.0; // P0401
+    dtc[10] = 403.0; // P0403 wiring fault
+    let log = log_from(&[("dtc_codes", dtc)]);
+    let f = r19_dtc_scan(&log, &full_pull());
+    assert_eq!(f.len(), 1);
+    assert_eq!(f[0].severity, Severity::Warn);
+    assert!(f[0].recommended_action_ref.as_ref().unwrap().contains("P0403"));
+}
+
+#[test]
+fn r19_quiet_when_no_egr_dtcs_present() {
+    let mut dtc = vec![f64::NAN; N];
+    dtc[5] = 300.0; // some other code, not in our list
+    let log = log_from(&[("dtc_codes", dtc)]);
+    let f = r19_dtc_scan(&log, &full_pull());
     assert!(f.is_empty());
 }

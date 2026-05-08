@@ -4,6 +4,12 @@
 //! implementation note) so it surfaces in `--help` and the Markdown
 //! report.
 
+use crate::platform::amf_edc15p::egr::{
+    in_cruise_band, CRUISE_PEDAL_MAX_PCT, DTC_LIST_TO_SUPPRESS, DTC_WIRING_FAULTS,
+    EGR_DUTY_OBSERVED_TOLERANCE_PCT, MAF_DEVIATION_FRACTION,
+    MAF_DEVIATION_MIN_DURATION_S, MAF_EXCESS_INFO_MG, COLD_START_COOLANT_CUTOFF_C,
+    WARM_COOLANT_MIN_C, WOT_PEDAL_CUTOFF_PCT,
+};
 use crate::platform::amf_edc15p::envelope::{CAPS, DIESEL_AFR_STOICH, NM_PER_MG_IQ};
 use crate::platform::amf_edc15p::stock_refs::stock_boost_at_rpm;
 use crate::rules::base::{make_skipped, Finding, Rule, Severity};
@@ -68,23 +74,23 @@ pub const R05: Rule = Rule {
     requires_groups: &["003"],
 };
 
-/// R06 — Lambda floor breach.
+/// R06 — Lambda floor breach (v3 floor: 1.05).
 pub const R06: Rule = Rule {
     id: "R06",
     severity: Severity::Critical,
     rationale_one_liner:
-        "Below λ = 1.20 on PD = visible smoke + EGT spike + DPF/cat damage. Hard floor is 1.05; we keep 0.15 of margin.",
-    recommended_delta_ref: Some("Smoke_IQ_by_MAF + Smoke_IQ_by_MAP: enforce λ ≥ 1.20"),
+        "Below λ = 1.05 = past stoich → incomplete combustion → EGT spike → ring-land cracks. v3 controlled-environment context relaxes the v2 1.20 floor but keeps 1.05 as a physical limit.",
+    recommended_delta_ref: Some("Smoke_IQ_by_MAF + Smoke_IQ_by_MAP: enforce λ ≥ 1.05"),
     requires_channels: &["maf_actual", "iq_requested"],
     requires_groups: &["003", "008"],
 };
 
-/// R07 — Peak IQ above sane envelope.
+/// R07 — Peak IQ above sane envelope (v3 cap: 54 mg/stroke).
 pub const R07: Rule = Rule {
     id: "R07",
     severity: Severity::Critical,
     rationale_one_liner:
-        "Above 52 mg the stock LUK clutch and stock injectors run out of headroom.",
+        "Above 54 mg/stroke the stock LUK clutch and stock injectors run out of headroom. v3 raised from 52 in v2 — smoke is acceptable in the controlled-env context, but injector duty and clutch torque are still hard limits.",
     recommended_delta_ref: Some("Driver_Wish + Duration"),
     requires_channels: &["iq_requested"],
     requires_groups: &["008"],
@@ -177,10 +183,70 @@ pub const R15: Rule = Rule {
     requires_groups: &["011"],
 };
 
-/// All rules in canonical order.
+// ---------------------------------------------------------------------------
+// v3 EGR-delete rule additions
+// ---------------------------------------------------------------------------
+
+/// R16 — EGR duty observed (delete not applied).
+pub const R16: Rule = Rule {
+    id: "R16",
+    severity: Severity::Critical,
+    rationale_one_liner:
+        "v3 mandates a software EGR delete. Any EGR duty > 2 % at any sample means the delete was not flashed, was applied to only one bank, or was overridden by the spec-MAF map polarity. Re-flash both banks of arwMEAB0KL → 0 % AND arwMLGRDKF → ≥850 mg/stroke.",
+    recommended_delta_ref: Some("AGR_arwMEAB0KL + arwMLGRDKF"),
+    requires_channels: &["egr_duty"],
+    requires_groups: &["003"],
+};
+
+/// R17 — MAF deviation post-delete (cruise, warm).
+pub const R17: Rule = Rule {
+    id: "R17",
+    severity: Severity::Warn,
+    rationale_one_liner:
+        "Post-delete cruise MAF should track spec-MAF closely (Strategy A) or sit cleanly above it (Strategy B). >15 % deviation sustained for >2 s indicates the spec-MAF map was not rescaled correctly.",
+    recommended_delta_ref: Some("arwMLGRDKF: re-flatten ≥850 mg/stroke"),
+    requires_channels: &["maf_actual", "maf_spec"],
+    requires_groups: &["003"],
+};
+
+/// R17b — MAF excess at cruise with EGR=0 (info, "delete is functional").
+pub const R17B: Rule = Rule {
+    id: "R17b",
+    severity: Severity::Info,
+    rationale_one_liner:
+        "Post-delete with Strategy-B saturation, MAF actual will sit well below spec-MAF (which is intentionally 850). MAF actual exceeding spec by ≥50 mg with EGR=0 confirms the delete is functional and the saturation is harmless.",
+    recommended_delta_ref: None,
+    requires_channels: &["maf_actual", "maf_spec", "egr_duty"],
+    requires_groups: &["003"],
+};
+
+/// R18 — Cruise SOI NVH check.
+pub const R18: Rule = Rule {
+    id: "R18",
+    severity: Severity::Info,
+    rationale_one_liner:
+        "Cruise-band SOI is unchanged from stock with EGR off. The premixed phase is faster without inert charge, which can raise NVH. Apply the −1.0° SOI retard to warm SOI maps 0..3 in the cruise band only if subjective NVH is objectionable.",
+    recommended_delta_ref: Some("SOI_warm_cruise"),
+    requires_channels: &["soi_actual", "egr_duty", "rpm", "iq_requested"],
+    requires_groups: &["020", "003", "008"],
+};
+
+/// R19 — DTC scan check.
+pub const R19: Rule = Rule {
+    id: "R19",
+    severity: Severity::Warn,
+    rationale_one_liner:
+        "P0401 / P0402 in a post-flash log mean the DTC was not suppressed. P0403 is a real solenoid wiring fault — investigate, do NOT just suppress. P0404 / P0405 / P0406 are unusual on AMF (no EGR position sensor) — flag for investigation.",
+    recommended_delta_ref: Some("DTC_thresholds"),
+    requires_channels: &["dtc_codes"],
+    requires_groups: &[],
+};
+
+/// All rules in canonical order (v3: R01..R15 + R16, R17, R17b, R18, R19).
 pub const ALL_RULES: &[&Rule] = &[
     &R01, &R02, &R03, &R04, &R05, &R06, &R07,
     &R08, &R09, &R10, &R11, &R12, &R13, &R14, &R15,
+    &R16, &R17, &R17B, &R18, &R19,
 ];
 
 // ---------------------------------------------------------------------------
@@ -623,6 +689,223 @@ pub fn r15_limp(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     )]
 }
 
+// ---------------------------------------------------------------------------
+// v3 EGR-delete rule predicates
+// ---------------------------------------------------------------------------
+
+/// R16 — Any sample with EGR duty > 2 % anywhere in the log (not just
+/// the pull). Evaluated against the entire log on the first pull only,
+/// so the same finding is not duplicated per pull.
+pub fn r16_egr_observed(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
+    if pull.pull_id != 1 {
+        return vec![];
+    }
+    if !log.has("egr_duty") {
+        return vec![make_skipped(&R16, pull, "channel egr_duty missing")];
+    }
+    let duty = match log.get("egr_duty") { Some(v) => v, None => return vec![] };
+    let max_observed = duty.iter().copied()
+        .filter(|x| x.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    if !max_observed.is_finite() || max_observed <= EGR_DUTY_OBSERVED_TOLERANCE_PCT {
+        return vec![];
+    }
+    vec![one(
+        &R16, pull, Severity::Critical,
+        max_observed, EGR_DUTY_OBSERVED_TOLERANCE_PCT,
+        R16.rationale_one_liner,
+        Some("AGR_arwMEAB0KL: zero all cells in both banks; arwMLGRDKF: ≥850 mg/stroke."),
+    )]
+}
+
+/// R17 — MAF deviation > 15 % sustained for > 2 s at warm cruise.
+pub fn r17_maf_deviation(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
+    if !has_all(log, &["maf_actual", "maf_spec"]) {
+        return vec![make_skipped(&R17, pull, "channels maf_actual/maf_spec missing")];
+    }
+    let actual = match slice(log, pull, "maf_actual") { Some(v) => v, None => return vec![] };
+    let spec = match slice(log, pull, "maf_spec") { Some(v) => v, None => return vec![] };
+    let coolant = slice(log, pull, "coolant_c");
+    let pedal = slice(log, pull, "tps_pct");
+    let times = slice_time(log, pull);
+
+    let n = actual.len();
+    if n == 0 { return vec![]; }
+    let dt = median_dt(times);
+    let min_run = ((MAF_DEVIATION_MIN_DURATION_S / dt).round() as usize).max(1);
+
+    let mut breach = vec![false; n];
+    let mut worst: f64 = 0.0;
+    for i in 0..n {
+        // Apply cold-start and WOT exclusions.
+        if let Some(c) = coolant {
+            if c[i].is_finite() && c[i] < COLD_START_COOLANT_CUTOFF_C { continue; }
+        }
+        if let Some(p) = pedal {
+            if p[i].is_finite() && p[i] >= WOT_PEDAL_CUTOFF_PCT { continue; }
+        }
+        if !actual[i].is_finite() || !spec[i].is_finite() || spec[i] <= 0.0 {
+            continue;
+        }
+        let deviation = (actual[i] - spec[i]).abs() / spec[i];
+        if deviation > MAF_DEVIATION_FRACTION {
+            breach[i] = true;
+            if deviation > worst { worst = deviation; }
+        }
+    }
+    let mut found_run = false;
+    let mut i = 0;
+    while i < n {
+        if breach[i] {
+            let mut j = i;
+            while j < n && breach[j] { j += 1; }
+            if (j - i) >= min_run { found_run = true; break; }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    if !found_run { return vec![]; }
+    vec![one(
+        &R17, pull, Severity::Warn,
+        worst * 100.0, MAF_DEVIATION_FRACTION * 100.0,
+        R17.rationale_one_liner,
+        Some("arwMLGRDKF: re-flatten ≥850 mg/stroke across all cells (Strategy B)."),
+    )]
+}
+
+/// R17b — MAF actual exceeds spec by ≥50 mg with EGR=0 → info, "delete
+/// is functional". Only fires when R17 does not (i.e. positive excess
+/// is fine; negative-or-symmetric deviation is what R17 catches).
+pub fn r17b_maf_excess_info(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
+    if !has_all(log, &["maf_actual", "maf_spec", "egr_duty"]) {
+        return vec![make_skipped(
+            &R17B, pull, "channels maf_actual/maf_spec/egr_duty missing",
+        )];
+    }
+    let actual = match slice(log, pull, "maf_actual") { Some(v) => v, None => return vec![] };
+    let spec = match slice(log, pull, "maf_spec") { Some(v) => v, None => return vec![] };
+    let egr = match slice(log, pull, "egr_duty") { Some(v) => v, None => return vec![] };
+
+    let mut max_excess: f64 = 0.0;
+    let mut any = false;
+    for i in 0..actual.len() {
+        if !actual[i].is_finite() || !spec[i].is_finite() || !egr[i].is_finite() {
+            continue;
+        }
+        if egr[i] > EGR_DUTY_OBSERVED_TOLERANCE_PCT {
+            // Don't claim "delete functional" when EGR is still active.
+            return vec![];
+        }
+        let excess = actual[i] - spec[i];
+        if excess >= MAF_EXCESS_INFO_MG {
+            any = true;
+            if excess > max_excess { max_excess = excess; }
+        }
+    }
+    if !any { return vec![]; }
+    vec![one(
+        &R17B, pull, Severity::Info,
+        max_excess, MAF_EXCESS_INFO_MG,
+        R17B.rationale_one_liner,
+        None,
+    )]
+}
+
+/// R18 — Cruise-band SOI is at or above stock (within ±0.2°) AND
+/// EGR=0 → info, recommend the −1.0° NVH retard.
+pub fn r18_cruise_nvh(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
+    if !has_all(log, &["soi_actual", "egr_duty", "rpm", "iq_requested"]) {
+        return vec![make_skipped(&R18, pull, "channels for cruise NVH missing")];
+    }
+    let soi = match slice(log, pull, "soi_actual") { Some(v) => v, None => return vec![] };
+    let egr = match slice(log, pull, "egr_duty") { Some(v) => v, None => return vec![] };
+    let rpm = match slice(log, pull, "rpm") { Some(v) => v, None => return vec![] };
+    let iq = match slice(log, pull, "iq_requested") { Some(v) => v, None => return vec![] };
+    let coolant = slice(log, pull, "coolant_c");
+    let pedal = slice(log, pull, "tps_pct");
+
+    let mut samples_in_band = 0usize;
+    let mut soi_at_or_above_stock = 0usize;
+    for i in 0..soi.len() {
+        if !soi[i].is_finite() || !rpm[i].is_finite() || !iq[i].is_finite() || !egr[i].is_finite() {
+            continue;
+        }
+        if egr[i] > EGR_DUTY_OBSERVED_TOLERANCE_PCT { continue; }
+        if !in_cruise_band(rpm[i], iq[i]) { continue; }
+        if let Some(c) = coolant {
+            if c[i].is_finite() && c[i] < WARM_COOLANT_MIN_C { continue; }
+        }
+        if let Some(p) = pedal {
+            if p[i].is_finite() && p[i] > CRUISE_PEDAL_MAX_PCT { continue; }
+        }
+        samples_in_band += 1;
+        // Stock cruise SOI is roughly 18-22° BTDC; "at or above stock"
+        // here is a stand-in for "no retard applied yet". Use 18° as the
+        // floor so any value at-or-above counts.
+        if soi[i] >= 18.0 - 0.2 {
+            soi_at_or_above_stock += 1;
+        }
+    }
+    if samples_in_band == 0 || soi_at_or_above_stock == 0 {
+        return vec![];
+    }
+    // Fire if a clear majority of the cruise samples show stock-or-above SOI.
+    if soi_at_or_above_stock * 2 < samples_in_band {
+        return vec![];
+    }
+    vec![one(
+        &R18, pull, Severity::Info,
+        soi_at_or_above_stock as f64, samples_in_band as f64,
+        R18.rationale_one_liner,
+        Some("SOI_warm_cruise: −1.0° BTDC in 1500-2500 rpm × 5-15 mg, warm SOI maps 0..3."),
+    )]
+}
+
+/// R19 — DTC scan: any P0401..P0406 in `dtc_codes`.
+pub fn r19_dtc_scan(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
+    if pull.pull_id != 1 {
+        return vec![];
+    }
+    if !log.data.contains_key("dtc_codes") {
+        return vec![make_skipped(&R19, pull, "channel dtc_codes missing")];
+    }
+    // dtc_codes is encoded as one numeric value per sample where each row
+    // is the integer suffix of a Pxxx code (e.g. 401 for P0401). Channels
+    // are floats so we represent absent as NaN.
+    let dtc = match log.get("dtc_codes") { Some(v) => v, None => return vec![] };
+    let observed: Vec<u16> = dtc.iter().copied()
+        .filter(|x| x.is_finite())
+        .map(|x| x.round() as u16)
+        .collect();
+    if observed.is_empty() {
+        return vec![];
+    }
+    // Map to P-codes and filter.
+    let suspect: Vec<&'static str> = DTC_LIST_TO_SUPPRESS.iter()
+        .copied()
+        .filter(|code| {
+            let n: u16 = code[1..].parse().unwrap_or(0);
+            observed.contains(&n)
+        })
+        .collect();
+    if suspect.is_empty() {
+        return vec![];
+    }
+    let wiring_fault = suspect.iter().any(|c| DTC_WIRING_FAULTS.contains(c));
+    let action = if wiring_fault {
+        "P0403 → real solenoid wiring fault, investigate before suppressing."
+    } else {
+        "DTC_thresholds: widen P0401/P0402 plausibility windows (or zero enable flags)."
+    };
+    vec![one(
+        &R19, pull, Severity::Warn,
+        suspect.len() as f64, 0.0,
+        R19.rationale_one_liner,
+        Some(action),
+    )]
+}
+
 /// Dispatch one rule against one pull, honouring the `LOW_RATE` flag for
 /// rules that downgrade on slow logs.
 pub fn dispatch(rule: &Rule, log: &ResampledLog, pull: &Pull, low_rate: bool) -> Vec<Finding> {
@@ -642,6 +925,11 @@ pub fn dispatch(rule: &Rule, log: &ResampledLog, pull: &Pull, low_rate: bool) ->
         "R13" => r13_fuel_temp(log, pull),
         "R14" => r14_srcv(log, pull),
         "R15" => r15_limp(log, pull),
+        "R16" => r16_egr_observed(log, pull),
+        "R17" => r17_maf_deviation(log, pull),
+        "R17b" => r17b_maf_excess_info(log, pull),
+        "R18" => r18_cruise_nvh(log, pull),
+        "R19" => r19_dtc_scan(log, pull),
         _ => Vec::new(),
     }
 }
