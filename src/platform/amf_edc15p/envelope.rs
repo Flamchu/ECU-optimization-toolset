@@ -25,8 +25,12 @@ pub struct EnvelopeCaps {
     pub peak_boost_above_4000rpm_mbar_abs: i32,
 
     /// Stock-injector duration headroom + LUK clutch torque ceiling.
+    /// v3 raised from 52 mg/stroke (smoke removed → only injector-duty
+    /// + clutch matter).
     pub peak_iq_mg: f64,
-    /// Lambda floor; below this PD smokes.
+    /// Lambda floor; v3 relaxed from 1.20 to 1.05 (smoke-tolerant
+    /// controlled-environment context). Below 1.0 is past stoich →
+    /// incomplete combustion → EGT spike → ring-land cracks.
     pub lambda_floor: f64,
     /// Cast-iron manifold creep + AMF has no oil-jet pistons.
     pub pre_turbo_egt_c_sustained: i32,
@@ -46,14 +50,23 @@ pub struct EnvelopeCaps {
 
     /// SVBL change cap — never touch the overboost cut.
     pub svbl_change_mbar: i32,
+
+    // --- v3 EGR-delete envelope additions -------------------------------
+    /// Maximum permitted EGR duty (%) in any recommended map. Mandatory
+    /// software EGR delete: every cell must be 0%.
+    pub egr_duty_max_pct: f64,
+    /// Strategy-B fill value for the spec-MAF map (mg/stroke). Saturates
+    /// the map so `MAF_actual − MAF_spec` is never positive and the EGR
+    /// PID never demands EGR.
+    pub spec_maf_fill_mg_stroke: f64,
 }
 
-/// Canonical, frozen instance of [`EnvelopeCaps`].
+/// Canonical, frozen instance of [`EnvelopeCaps`] (v3 EGR-delete edition).
 pub const CAPS: EnvelopeCaps = EnvelopeCaps {
     peak_boost_mbar_abs: 2150,
     peak_boost_above_4000rpm_mbar_abs: 2050,
-    peak_iq_mg: 52.0,
-    lambda_floor: 1.20,
+    peak_iq_mg: 54.0,         // v3: was 52 in v2
+    lambda_floor: 1.05,       // v3: was 1.20 in v2
     pre_turbo_egt_c_sustained: 800,
     soi_max_btdc: 26.0,
     soi_iq_threshold_mg: 30.0,
@@ -61,6 +74,8 @@ pub const CAPS: EnvelopeCaps = EnvelopeCaps {
     modelled_flywheel_torque_nm: 240.0,
     maf_max_mg_stroke: 1000.0,
     svbl_change_mbar: 0,
+    egr_duty_max_pct: 0.0,
+    spec_maf_fill_mg_stroke: 850.0,
 };
 
 /// Result of running a single proposed value through the envelope.
@@ -194,6 +209,41 @@ pub fn clamp_svbl(proposed_change_mbar: f64) -> ClampOutcome {
     ClampOutcome::ok(0.0)
 }
 
+/// Refuse any non-zero EGR duty in a recommended map. v3 software-delete
+/// is mandatory.
+pub fn clamp_egr_duty_pct(proposed_duty_pct: f64) -> ClampOutcome {
+    if proposed_duty_pct.abs() > f64::EPSILON {
+        return ClampOutcome::blocked(
+            CAPS.egr_duty_max_pct,
+            "egr_duty_max_pct",
+            "v3 mandates software EGR delete: EGR duty must be 0% in every \
+             recommended map cell. Mechanical EGR hardware stays installed; \
+             only the duty map and spec-MAF map are flashed."
+                .to_string(),
+        );
+    }
+    ClampOutcome::ok(CAPS.egr_duty_max_pct)
+}
+
+/// Cap a spec-MAF cell so it never falls below the saturation fill value.
+/// The Strategy-B default (850 mg/stroke) saturates the EGR PID setpoint
+/// so it never demands EGR.
+pub fn clamp_spec_maf(proposed_mg_stroke: f64) -> ClampOutcome {
+    if proposed_mg_stroke < CAPS.spec_maf_fill_mg_stroke {
+        return ClampOutcome::blocked(
+            CAPS.spec_maf_fill_mg_stroke,
+            "spec_maf_fill_mg_stroke",
+            format!(
+                "Spec-MAF cells must be ≥ {} mg/stroke (Strategy-B saturation) \
+                 so MAF_actual − MAF_spec is never positive and the EGR PID \
+                 never demands EGR.",
+                CAPS.spec_maf_fill_mg_stroke
+            ),
+        );
+    }
+    ClampOutcome::ok(proposed_mg_stroke)
+}
+
 /// Reject end-of-injection later than 10° ATDC.
 pub fn clamp_eoi_atdc(proposed_eoi_atdc: f64) -> ClampOutcome {
     if proposed_eoi_atdc > CAPS.eoi_max_atdc {
@@ -239,15 +289,22 @@ mod tests {
 
     #[test]
     fn iq_at_cap_passes() {
-        let r = clamp_iq(52.0);
+        let r = clamp_iq(54.0);
         assert!(!r.blocked);
     }
 
     #[test]
     fn iq_above_cap_blocked() {
-        let r = clamp_iq(55.0);
+        let r = clamp_iq(56.0);
         assert!(r.blocked);
-        assert_eq!(r.value, 52.0);
+        assert_eq!(r.value, 54.0);
+    }
+
+    #[test]
+    fn iq_v2_old_cap_now_passes() {
+        // v2's 52 mg/stroke should no longer trigger.
+        let r = clamp_iq(52.0);
+        assert!(!r.blocked);
     }
 
     #[test]
@@ -266,8 +323,22 @@ mod tests {
 
     #[test]
     fn lambda_below_floor_blocked() {
-        let r = clamp_lambda_floor(1.10);
+        // v3 floor is 1.05; below stoich is the new line.
+        let r = clamp_lambda_floor(1.00);
         assert!(r.blocked);
+    }
+
+    #[test]
+    fn lambda_at_v3_floor_passes() {
+        let r = clamp_lambda_floor(1.05);
+        assert!(!r.blocked);
+    }
+
+    #[test]
+    fn lambda_at_v2_old_floor_now_passes() {
+        // v2's 1.20 used to be the floor; v3 relaxes to 1.05.
+        let r = clamp_lambda_floor(1.10);
+        assert!(!r.blocked);
     }
 
     #[test]
@@ -282,5 +353,33 @@ mod tests {
         let r = clamp_eoi_atdc(15.0);
         assert!(r.blocked);
         assert_eq!(r.value, 10.0);
+    }
+
+    #[test]
+    fn egr_duty_zero_passes() {
+        let r = clamp_egr_duty_pct(0.0);
+        assert!(!r.blocked);
+        assert_eq!(r.value, 0.0);
+    }
+
+    #[test]
+    fn egr_duty_nonzero_blocked() {
+        let r = clamp_egr_duty_pct(15.0);
+        assert!(r.blocked);
+        assert_eq!(r.value, 0.0);
+        assert_eq!(r.cap_name, "egr_duty_max_pct");
+    }
+
+    #[test]
+    fn spec_maf_at_fill_passes() {
+        let r = clamp_spec_maf(850.0);
+        assert!(!r.blocked);
+    }
+
+    #[test]
+    fn spec_maf_below_fill_blocked() {
+        let r = clamp_spec_maf(400.0);
+        assert!(r.blocked);
+        assert_eq!(r.value, 850.0);
     }
 }
