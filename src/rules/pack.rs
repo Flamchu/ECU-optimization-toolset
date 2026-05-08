@@ -1,31 +1,123 @@
-//! Rule pack for AMF / EDC15P+ — R01..R15.
+//! Rule pack for AMF / EDC15P+ — R01..R21 (v4, audit-reconciled).
 //!
-//! Each rule below carries its rationale as a docstring (per spec §10
+//! Each rule below carries its rationale as a docstring (per spec §6
 //! implementation note) so it surfaces in `--help` and the Markdown
 //! report.
 
 use crate::platform::amf_edc15p::egr::{
-    in_cruise_band, CRUISE_PEDAL_MAX_PCT, DTC_LIST_TO_SUPPRESS, DTC_WIRING_FAULTS,
-    EGR_DUTY_OBSERVED_TOLERANCE_PCT, MAF_DEVIATION_FRACTION,
-    MAF_DEVIATION_MIN_DURATION_S, MAF_EXCESS_INFO_MG, COLD_START_COOLANT_CUTOFF_C,
-    WARM_COOLANT_MIN_C, WOT_PEDAL_CUTOFF_PCT,
+    in_cruise_band, CRUISE_PEDAL_MAX_PCT, DTC_GROUP_B, DTC_LIST_TO_SUPPRESS,
+    DTC_WIRING_FAULTS, EGR_DUTY_OBSERVED_TOLERANCE_PCT,
+    IDLE_INSTABILITY_INFO_RPM_STD, IDLE_INSTABILITY_THRESHOLD_RPM_STD,
+    IDLE_PEDAL_MAX_PCT, IDLE_WINDOW_MIN_S, MAF_DEVIATION_FRACTION,
+    MAF_DEVIATION_MIN_DURATION_S, MAF_EXCESS_INFO_MG, WOT_PEDAL_CUTOFF_PCT,
 };
 use crate::platform::amf_edc15p::envelope::{CAPS, DIESEL_AFR_STOICH, NM_PER_MG_IQ};
 use crate::platform::amf_edc15p::stock_refs::stock_boost_at_rpm;
-use crate::rules::base::{make_skipped, Finding, Rule, Severity};
+use crate::rules::base::{make_skipped, Finding, Rule, RuleScope, Severity};
 use crate::util::timebase::ResampledLog;
 use crate::util::Pull;
 
 // ---------------------------------------------------------------------------
-// Rule definitions
+// Rule id enumeration (exhaustive — every variant must be dispatched).
+// ---------------------------------------------------------------------------
+
+/// All 21 rule ids in canonical order. Used for exhaustive dispatch and
+/// the v4 acceptance test that asserts every variant is reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RuleId {
+    /// R01 — Underboost.
+    R01,
+    /// R02 — Overboost spike.
+    R02,
+    /// R03 — Boost target excessive.
+    R03,
+    /// R04 — High-RPM boost not tapering.
+    R04,
+    /// R05 — MAF below spec.
+    R05,
+    /// R06 — Lambda floor breach.
+    R06,
+    /// R07 — Peak IQ above envelope.
+    R07,
+    /// R08 — Modelled torque above clutch.
+    R08,
+    /// R09 — SOI excess.
+    R09,
+    /// R10 — EOI late.
+    R10,
+    /// R11 — Coolant low during pull.
+    R11,
+    /// R12 — Atmospheric pressure missing.
+    R12,
+    /// R13 — Fuel temp high.
+    R13,
+    /// R14 — Smooth-running deviation.
+    R14,
+    /// R15 — Limp / N75 clamped.
+    R15,
+    /// R16 — EGR duty observed.
+    R16,
+    /// R17 — MAF deviation post-delete.
+    R17,
+    /// R18 — Cruise SOI NVH.
+    R18,
+    /// R19 — DTC scan.
+    R19,
+    /// R20 — Cruise spec-MAF excess (was R17b).
+    R20,
+    /// R21 — Idle stability.
+    R21,
+}
+
+/// Iteration order for the rule pack.
+pub const ALL_RULE_IDS: &[RuleId] = &[
+    RuleId::R01, RuleId::R02, RuleId::R03, RuleId::R04, RuleId::R05,
+    RuleId::R06, RuleId::R07, RuleId::R08, RuleId::R09, RuleId::R10,
+    RuleId::R11, RuleId::R12, RuleId::R13, RuleId::R14, RuleId::R15,
+    RuleId::R16, RuleId::R17, RuleId::R18, RuleId::R19, RuleId::R20,
+    RuleId::R21,
+];
+
+impl RuleId {
+    /// Short string id used everywhere outside the dispatcher (`"R01"`,
+    /// ... `"R21"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::R01 => "R01", Self::R02 => "R02", Self::R03 => "R03",
+            Self::R04 => "R04", Self::R05 => "R05", Self::R06 => "R06",
+            Self::R07 => "R07", Self::R08 => "R08", Self::R09 => "R09",
+            Self::R10 => "R10", Self::R11 => "R11", Self::R12 => "R12",
+            Self::R13 => "R13", Self::R14 => "R14", Self::R15 => "R15",
+            Self::R16 => "R16", Self::R17 => "R17", Self::R18 => "R18",
+            Self::R19 => "R19", Self::R20 => "R20", Self::R21 => "R21",
+        }
+    }
+
+    /// Look up the static [`Rule`] descriptor.
+    pub fn rule(self) -> &'static Rule {
+        match self {
+            Self::R01 => &R01, Self::R02 => &R02, Self::R03 => &R03,
+            Self::R04 => &R04, Self::R05 => &R05, Self::R06 => &R06,
+            Self::R07 => &R07, Self::R08 => &R08, Self::R09 => &R09,
+            Self::R10 => &R10, Self::R11 => &R11, Self::R12 => &R12,
+            Self::R13 => &R13, Self::R14 => &R14, Self::R15 => &R15,
+            Self::R16 => &R16, Self::R17 => &R17, Self::R18 => &R18,
+            Self::R19 => &R19, Self::R20 => &R20, Self::R21 => &R21,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rule descriptors (R01..R21)
 // ---------------------------------------------------------------------------
 
 /// R01 — Underboost.
 pub const R01: Rule = Rule {
     id: "R01",
     severity: Severity::Warn,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "KP35 PID can't keep up: leak, sticky wastegate, or LDRXN ramp too steep for turbo.",
+        "Persistent underboost: leak, dirty MAF, sticky wastegate, or LDRXN ramp too steep.",
     recommended_delta_ref: Some("LDRXN/N75_duty"),
     requires_channels: &["rpm", "boost_actual", "boost_spec"],
     requires_groups: &["011"],
@@ -35,8 +127,9 @@ pub const R01: Rule = Rule {
 pub const R02: Rule = Rule {
     id: "R02",
     severity: Severity::Critical,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "KP35 sustained over 2150 mbar pushes shaft past the right edge of the compressor map → over-speed.",
+        "Garrett GT1544S sustained over 2150 mbar pushes shaft past the right edge of the compressor map → overspeed.",
     recommended_delta_ref: Some("LDRXN: lower target"),
     requires_channels: &["boost_actual", "boost_spec"],
     requires_groups: &["011"],
@@ -46,7 +139,8 @@ pub const R02: Rule = Rule {
 pub const R03: Rule = Rule {
     id: "R03",
     severity: Severity::Critical,
-    rationale_one_liner: "Hard envelope ceiling for KP35 longevity.",
+    scope: RuleScope::PerPull,
+    rationale_one_liner: "Hard envelope ceiling for Garrett GT1544S longevity.",
     recommended_delta_ref: Some("LDRXN: rpm 2000-3500"),
     requires_channels: &["rpm", "boost_spec"],
     requires_groups: &["011"],
@@ -56,8 +150,9 @@ pub const R03: Rule = Rule {
 pub const R04: Rule = Rule {
     id: "R04",
     severity: Severity::Warn,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "KP35 is choke-flow-limited: you must back off above 4000 to keep it in the efficiency island.",
+        "Garrett GT1544S is choke-flow-limited above 4000 rpm; back off to keep it in the efficiency island.",
     recommended_delta_ref: Some("LDRXN taper rpm 4000-4500"),
     requires_channels: &["rpm", "boost_spec"],
     requires_groups: &["011"],
@@ -67,6 +162,7 @@ pub const R04: Rule = Rule {
 pub const R05: Rule = Rule {
     id: "R05",
     severity: Severity::Warn,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
         "MAF drift, dirty intake, boost leak, or MAF aging — fueling decisions become wrong.",
     recommended_delta_ref: Some("MLHFM (only if MAF replaced)"),
@@ -74,23 +170,25 @@ pub const R05: Rule = Rule {
     requires_groups: &["003"],
 };
 
-/// R06 — Lambda floor breach (v3 floor: 1.05).
+/// R06 — Lambda floor breach (v4 floor: 1.05).
 pub const R06: Rule = Rule {
     id: "R06",
     severity: Severity::Critical,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "Below λ = 1.05 = past stoich → incomplete combustion → EGT spike → ring-land cracks. v3 controlled-environment context relaxes the v2 1.20 floor but keeps 1.05 as a physical limit.",
+        "Below λ = 1.05 = past stoich → incomplete combustion → EGT spike → ring-land cracks.",
     recommended_delta_ref: Some("Smoke_IQ_by_MAF + Smoke_IQ_by_MAP: enforce λ ≥ 1.05"),
     requires_channels: &["maf_actual", "iq_requested"],
     requires_groups: &["003", "008"],
 };
 
-/// R07 — Peak IQ above sane envelope (v3 cap: 54 mg/stroke).
+/// R07 — Peak IQ above sane envelope (v4 cap: 54 mg/stroke).
 pub const R07: Rule = Rule {
     id: "R07",
     severity: Severity::Critical,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "Above 54 mg/stroke the stock LUK clutch and stock injectors run out of headroom. v3 raised from 52 in v2 — smoke is acceptable in the controlled-env context, but injector duty and clutch torque are still hard limits.",
+        "Above 54 mg/stroke the PD75 nozzle duration headroom and LUK clutch torque ceiling run out.",
     recommended_delta_ref: Some("Driver_Wish + Duration"),
     requires_channels: &["iq_requested"],
     requires_groups: &["008"],
@@ -100,30 +198,34 @@ pub const R07: Rule = Rule {
 pub const R08: Rule = Rule {
     id: "R08",
     severity: Severity::Critical,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "LUK SMF rated ~195 Nm + ~20 % = 240 Nm hard ceiling. Above this the clutch slips within weeks.",
+        "LUK SMF engineering ceiling 240 Nm (LUK does not publish a rating). Above this the clutch slips within weeks.",
     recommended_delta_ref: Some("Torque_Limiter: clamp peak ≤ 240 Nm"),
     requires_channels: &["iq_requested"],
     requires_groups: &["008"],
 };
 
-/// R09 — SOI excess.
+/// R09 — SOI excess. Critical → Warn under LOW_RATE.
 pub const R09: Rule = Rule {
     id: "R09",
     severity: Severity::Critical,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "Beyond 26° BTDC peak cylinder pressure migrates ahead of TDC → piston crown stress; cam-lobe physical limit is ~35° but safe usable limit is 26-28°.",
+        "Beyond 26° BTDC at IQ ≥ 30 mg, peak cylinder pressure migrates ahead of TDC → piston crown stress.",
     recommended_delta_ref: Some("SOI: cap at 26° BTDC absolute"),
     requires_channels: &["soi_actual", "iq_requested"],
     requires_groups: &["020", "008"],
 };
 
-/// R10 — EOI late.
+/// R10 — EOI late. Warn baseline; no LOW_RATE downgrade because Warn is
+/// already the lowest non-info severity.
 pub const R10: Rule = Rule {
     id: "R10",
     severity: Severity::Warn,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "Combustion past ~6-10° ATDC dumps unburned heat into the turbine → high EGT, poor BSFC.",
+        "Combustion past 10° ATDC dumps unburned heat into the turbine → high EGT, poor BSFC. Duration is a screening heuristic.",
     recommended_delta_ref: Some("SOI/Duration: re-balance"),
     requires_channels: &["soi_actual", "iq_requested", "rpm"],
     requires_groups: &["020", "008"],
@@ -133,8 +235,9 @@ pub const R10: Rule = Rule {
 pub const R11: Rule = Rule {
     id: "R11",
     severity: Severity::Info,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "EDC15P+ uses cold SOI map below 80 °C — your data isn't representative of warm calibration. Re-do the pull.",
+        "EDC15P+ uses cold SOI map below 80 °C — pull data is not representative of warm calibration.",
     recommended_delta_ref: None,
     requires_channels: &["coolant_c"],
     requires_groups: &["001"],
@@ -144,8 +247,9 @@ pub const R11: Rule = Rule {
 pub const R12: Rule = Rule {
     id: "R12",
     severity: Severity::Info,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "Without ambient pressure capture (key-on, engine-off, group 010), altitude derate can't be assessed.",
+        "Without ambient pressure capture (group 010 key-on/engine-off), altitude derate cannot be assessed.",
     recommended_delta_ref: None,
     requires_channels: &["atm_pressure"],
     requires_groups: &["010"],
@@ -155,8 +259,9 @@ pub const R12: Rule = Rule {
 pub const R13: Rule = Rule {
     id: "R13",
     severity: Severity::Warn,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "High fuel temp = lower density = lower delivered IQ for same duration → boost target overshoots fuelling.",
+        "High fuel temp = lower density = lower delivered IQ for same duration → boost overshoots fuelling.",
     recommended_delta_ref: None,
     requires_channels: &["fuel_temp_c"],
     requires_groups: &["013"],
@@ -166,17 +271,19 @@ pub const R13: Rule = Rule {
 pub const R14: Rule = Rule {
     id: "R14",
     severity: Severity::Warn,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "Indicates worn injector cam lobe (PD weak point) or failing injector. Tuning a sick engine = killing it faster.",
+        "Worn injector cam lobe (PD weak point) or failing injector. Tuning a sick engine kills it faster.",
     recommended_delta_ref: None,
     requires_channels: &["srcv_cyl1", "srcv_cyl2", "srcv_cyl3"],
     requires_groups: &["013"],
 };
 
-/// R15 — Limp / DTC interruption.
+/// R15 — Limp / N75 clamped.
 pub const R15: Rule = Rule {
     id: "R15",
     severity: Severity::Warn,
+    scope: RuleScope::PerPull,
     rationale_one_liner: "ECU is in limp mode — log is not valid for tuning.",
     recommended_delta_ref: None,
     requires_channels: &["n75_duty"],
@@ -184,16 +291,18 @@ pub const R15: Rule = Rule {
 };
 
 // ---------------------------------------------------------------------------
-// v3 EGR-delete rule additions
+// v4 EGR-delete + idle-stability additions (R16..R21)
 // ---------------------------------------------------------------------------
 
-/// R16 — EGR duty observed (delete not applied).
+/// R16 — EGR duty observed (delete not applied). Global scope.
 pub const R16: Rule = Rule {
     id: "R16",
     severity: Severity::Critical,
+    scope: RuleScope::Global,
     rationale_one_liner:
-        "v3 mandates a software EGR delete. Any EGR duty > 2 % at any sample means the delete was not flashed, was applied to only one bank, or was overridden by the spec-MAF map polarity. Re-flash both banks of arwMEAB0KL → 0 % AND arwMLGRDKF → ≥850 mg/stroke.",
-    recommended_delta_ref: Some("AGR_arwMEAB0KL + arwMLGRDKF"),
+        "v4 mandates a software EGR delete. Any EGR duty > 2 % anywhere in the log means the delete \
+         was not flashed, was applied to only one bank, or was overridden by spec-MAF polarity.",
+    recommended_delta_ref: Some("AGR_arwMEAB0KL + AGR_arwMEAB1KL + arwMLGRDKF"),
     requires_channels: &["egr_duty"],
     requires_groups: &["003"],
 };
@@ -202,58 +311,81 @@ pub const R16: Rule = Rule {
 pub const R17: Rule = Rule {
     id: "R17",
     severity: Severity::Warn,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "Post-delete cruise MAF should track spec-MAF closely (Strategy A) or sit cleanly above it (Strategy B). >15 % deviation sustained for >2 s indicates the spec-MAF map was not rescaled correctly.",
+        "Cruise MAF should track spec-MAF closely (Strategy A) or sit above it (Strategy B). >15 % deviation \
+         sustained for >2 s indicates the spec-MAF map was not rescaled correctly. Reads `pedal_pct` (driver wish).",
     recommended_delta_ref: Some("arwMLGRDKF: re-flatten ≥850 mg/stroke"),
-    requires_channels: &["maf_actual", "maf_spec"],
+    requires_channels: &["maf_actual", "maf_spec", "pedal_pct"],
     requires_groups: &["003"],
 };
 
-/// R17b — MAF excess at cruise with EGR=0 (info, "delete is functional").
-pub const R17B: Rule = Rule {
-    id: "R17b",
-    severity: Severity::Info,
-    rationale_one_liner:
-        "Post-delete with Strategy-B saturation, MAF actual will sit well below spec-MAF (which is intentionally 850). MAF actual exceeding spec by ≥50 mg with EGR=0 confirms the delete is functional and the saturation is harmless.",
-    recommended_delta_ref: None,
-    requires_channels: &["maf_actual", "maf_spec", "egr_duty"],
-    requires_groups: &["003"],
-};
-
-/// R18 — Cruise SOI NVH check.
+/// R18 — Cruise-band SOI NVH check.
 pub const R18: Rule = Rule {
     id: "R18",
     severity: Severity::Info,
+    scope: RuleScope::PerPull,
     rationale_one_liner:
-        "Cruise-band SOI is unchanged from stock with EGR off. The premixed phase is faster without inert charge, which can raise NVH. Apply the −1.0° SOI retard to warm SOI maps 0..3 in the cruise band only if subjective NVH is objectionable.",
+        "Cruise-band SOI is at stock with EGR off. Premixed phase is faster without inert charge → NVH bump. \
+         Apply −1.0° SOI retard to warm SOI maps 0..3 in the cruise band only if subjective NVH is objectionable.",
     recommended_delta_ref: Some("SOI_warm_cruise"),
     requires_channels: &["soi_actual", "egr_duty", "rpm", "iq_requested"],
     requires_groups: &["020", "003", "008"],
 };
 
-/// R19 — DTC scan check.
+/// R19 — DTC scan check. Global scope; reads from `VcdsLog.dtcs`.
 pub const R19: Rule = Rule {
     id: "R19",
     severity: Severity::Warn,
+    scope: RuleScope::Global,
     rationale_one_liner:
-        "P0401 / P0402 in a post-flash log mean the DTC was not suppressed. P0403 is a real solenoid wiring fault — investigate, do NOT just suppress. P0404 / P0405 / P0406 are unusual on AMF (no EGR position sensor) — flag for investigation.",
+        "P0401/P0402/P0403 (Group A, real on AMF) post-flash mean the DTC was not suppressed (P0401/P0402) \
+         or the EGR solenoid has a real wiring fault (P0403 — investigate, do NOT just suppress). \
+         P0404/P0405/P0406 (Group B) should not appear on AMF and indicate code-list error or non-AMF ECU.",
     recommended_delta_ref: Some("DTC_thresholds"),
-    requires_channels: &["dtc_codes"],
+    requires_channels: &[],
     requires_groups: &[],
 };
 
-/// All rules in canonical order (v3: R01..R15 + R16, R17, R17b, R18, R19).
+/// R20 — Cruise spec-MAF excess (was R17b in v3 — promoted to R20 for
+/// flat numbering).
+pub const R20: Rule = Rule {
+    id: "R20",
+    severity: Severity::Info,
+    scope: RuleScope::PerPull,
+    rationale_one_liner:
+        "Post-delete with Strategy-B saturation, MAF actual exceeding spec by ≥50 mg with EGR=0 confirms the \
+         delete is functional and the saturation is harmless.",
+    recommended_delta_ref: None,
+    requires_channels: &["maf_actual", "maf_spec", "egr_duty"],
+    requires_groups: &["003"],
+};
+
+/// R21 — Idle stability (NEW in v4). Global scope; evaluates the warm
+/// idle window across the whole log.
+pub const R21: Rule = Rule {
+    id: "R21",
+    severity: Severity::Warn,
+    scope: RuleScope::Global,
+    rationale_one_liner:
+        "RPM σ > 25 over a 30-s warm-idle window catches injector / mech imbalance survival. \
+         Severity downgrades to Info if the window is < 30 s (insufficient evidence).",
+    recommended_delta_ref: Some("Idle_fuel"),
+    requires_channels: &["rpm", "coolant_c"],
+    requires_groups: &["001"],
+};
+
+/// All rules in canonical order (v4: R01..R21).
 pub const ALL_RULES: &[&Rule] = &[
     &R01, &R02, &R03, &R04, &R05, &R06, &R07,
     &R08, &R09, &R10, &R11, &R12, &R13, &R14, &R15,
-    &R16, &R17, &R17B, &R18, &R19,
+    &R16, &R17, &R18, &R19, &R20, &R21,
 ];
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Return slice indices `[i_start, i_end)` for the given pull.
 fn slice<'a>(log: &'a ResampledLog, pull: &Pull, name: &str) -> Option<&'a [f64]> {
     let v = log.get(name)?;
     if pull.i_end > v.len() || pull.i_start > pull.i_end {
@@ -296,6 +428,15 @@ fn finite_mean(xs: &[f64]) -> Option<f64> {
     if n == 0 { None } else { Some(sum / n as f64) }
 }
 
+fn finite_mean_std(xs: &[f64]) -> Option<(f64, f64)> {
+    let finite: Vec<f64> = xs.iter().copied().filter(|x| x.is_finite()).collect();
+    if finite.is_empty() { return None; }
+    let n = finite.len() as f64;
+    let mean = finite.iter().sum::<f64>() / n;
+    let var = finite.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n;
+    Some((mean, var.sqrt()))
+}
+
 fn median_dt(times: &[f64]) -> f64 {
     if times.len() < 2 { return 0.2; }
     let mut diffs: Vec<f64> = times.windows(2)
@@ -307,7 +448,8 @@ fn median_dt(times: &[f64]) -> f64 {
     diffs[diffs.len() / 2]
 }
 
-/// PD injection duration model: ~0.55°/mg at low RPM, scales with RPM.
+/// PD injection-duration screening heuristic. Documented in spec §6 R10
+/// as a screening estimator only — it is NOT a physical PD model.
 fn model_duration_deg(iq_mg: f64, rpm: f64) -> f64 {
     let scale = (rpm.max(600.0) / 3000.0).sqrt();
     iq_mg * 0.55 * scale
@@ -340,7 +482,7 @@ fn one(
 // Rule predicates
 // ---------------------------------------------------------------------------
 
-/// R01 — Underboost: actual < spec − 150 mbar for ≥ 1.0 s above 2000 rpm.
+/// R01 — actual < spec − 150 mbar for ≥ 1.0 s above 2000 rpm.
 pub fn r01_underboost(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     if !has_all(log, &["rpm", "boost_actual", "boost_spec"]) {
         return vec![make_skipped(&R01, pull, "channels rpm/boost_spec/boost_actual missing")];
@@ -360,9 +502,7 @@ pub fn r01_underboost(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
         let err = spec[i] - actual[i];
         breach[i] = rpm[i] >= 2000.0 && err >= 150.0;
     }
-    if !breach.iter().any(|&b| b) {
-        return vec![];
-    }
+    if !breach.iter().any(|&b| b) { return vec![]; }
     let dt = median_dt(times);
     let min_run = ((1.0 / dt).round() as usize).max(1);
     let mut found_run = false;
@@ -371,10 +511,7 @@ pub fn r01_underboost(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
         if breach[i] {
             let mut j = i;
             while j < n && breach[j] { j += 1; }
-            if (j - i) >= min_run {
-                found_run = true;
-                break;
-            }
+            if (j - i) >= min_run { found_run = true; break; }
             i = j;
         } else {
             i += 1;
@@ -393,7 +530,7 @@ pub fn r01_underboost(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     )]
 }
 
-/// R02 — Overboost: actual > spec + 200 mbar OR > 2200 mbar abs.
+/// R02 — actual > spec + 200 mbar OR > 2200 mbar abs.
 pub fn r02_overboost_spike(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     if !has_all(log, &["boost_actual", "boost_spec"]) {
         return vec![make_skipped(&R02, pull, "channels boost_actual/boost_spec missing")];
@@ -418,7 +555,7 @@ pub fn r02_overboost_spike(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     )]
 }
 
-/// R03 — Boost target excessive: any spec > 2150 mbar abs, or > stock+250.
+/// R03 — any spec > 2150 mbar abs, or > stock+250.
 pub fn r03_boost_target_excessive(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     if !has_all(log, &["rpm", "boost_spec"]) {
         return vec![make_skipped(&R03, pull, "channels rpm/boost_spec missing")];
@@ -461,9 +598,7 @@ pub fn r04_no_taper(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     let near_4500: Vec<f64> = rpm.iter().zip(spec.iter())
         .filter(|(r, s)| (4400.0..=4600.0).contains(*r) && s.is_finite())
         .map(|(_, s)| *s).collect();
-    if near_3000.is_empty() || near_4500.is_empty() {
-        return vec![];
-    }
+    if near_3000.is_empty() || near_4500.is_empty() { return vec![]; }
     let med = |xs: &[f64]| -> f64 {
         let mut v: Vec<f64> = xs.to_vec();
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -497,7 +632,7 @@ pub fn r05_maf_below_spec(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     )]
 }
 
-/// R06 — Lambda floor breach: any sample where λ < 1.20.
+/// R06 — Lambda floor breach: any sample where λ < 1.05.
 pub fn r06_lambda_floor(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     if !has_all(log, &["maf_actual", "iq_requested"]) {
         return vec![make_skipped(&R06, pull, "channels maf_actual/iq_requested missing")];
@@ -507,9 +642,7 @@ pub fn r06_lambda_floor(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     let n = maf.len();
     let mut min_lambda = f64::INFINITY;
     for i in 0..n {
-        if !maf[i].is_finite() || !iq[i].is_finite() || iq[i] <= 0.0 {
-            continue;
-        }
+        if !maf[i].is_finite() || !iq[i].is_finite() || iq[i] <= 0.0 { continue; }
         let lam = maf[i] / (iq[i] * DIESEL_AFR_STOICH);
         if lam < min_lambda { min_lambda = lam; }
     }
@@ -517,11 +650,11 @@ pub fn r06_lambda_floor(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     vec![one(
         &R06, pull, Severity::Critical, min_lambda, CAPS.lambda_floor,
         R06.rationale_one_liner,
-        Some("Smoke_IQ_by_MAF/MAP: raise IQ cap so λ ≥ 1.20 at this MAF."),
+        Some("Smoke_IQ_by_MAF/MAP: raise IQ cap so λ ≥ 1.05 at this MAF."),
     )]
 }
 
-/// R07 — IQ requested > 52 mg/stroke.
+/// R07 — IQ requested > peak_iq_mg cap.
 pub fn r07_peak_iq(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     if !log.has("iq_requested") {
         return vec![make_skipped(&R07, pull, "channel iq_requested missing")];
@@ -532,11 +665,11 @@ pub fn r07_peak_iq(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     vec![one(
         &R07, pull, Severity::Critical, peak, CAPS.peak_iq_mg,
         R07.rationale_one_liner,
-        Some("Driver_Wish: cap WOT request at 52 mg/stroke."),
+        Some("Driver_Wish: cap WOT request at envelope IQ cap."),
     )]
 }
 
-/// R08 — Modelled flywheel torque (4.4 Nm/mg) > 240 Nm.
+/// R08 — Modelled flywheel torque > clutch ceiling.
 pub fn r08_torque_ceiling(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     if !log.has("iq_requested") {
         return vec![make_skipped(&R08, pull, "channel iq_requested missing")];
@@ -553,10 +686,8 @@ pub fn r08_torque_ceiling(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     )]
 }
 
-/// R09 — soi_actual > 26° BTDC at any IQ ≥ 30 mg.
-///
-/// On a `LOW_RATE` pull, severity is downgraded to warn because SOI
-/// transients can be missed at the slow VCDS sample rate.
+/// R09 — soi_actual > 26° BTDC at any IQ ≥ 30 mg. Critical → Warn under
+/// `LOW_RATE` because SOI transients can be missed at slow VCDS rates.
 pub fn r09_soi_excess(log: &ResampledLog, pull: &Pull, low_rate: bool) -> Vec<Finding> {
     if !has_all(log, &["soi_actual", "iq_requested"]) {
         return vec![make_skipped(&R09, pull, "channels soi_actual/iq_requested missing")];
@@ -580,8 +711,9 @@ pub fn r09_soi_excess(log: &ResampledLog, pull: &Pull, low_rate: bool) -> Vec<Fi
     )]
 }
 
-/// R10 — Computed EOI = SOI − duration_model > 10° ATDC.
-pub fn r10_eoi_late(log: &ResampledLog, pull: &Pull, _low_rate: bool) -> Vec<Finding> {
+/// R10 — Computed EOI = SOI − duration_model > 10° ATDC. v4: no
+/// LOW_RATE downgrade (Warn baseline).
+pub fn r10_eoi_late(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     if !has_all(log, &["soi_actual", "iq_requested", "rpm"]) {
         return vec![make_skipped(&R10, pull, "channels soi_actual/iq_requested/rpm missing")];
     }
@@ -594,9 +726,7 @@ pub fn r10_eoi_late(log: &ResampledLog, pull: &Pull, _low_rate: bool) -> Vec<Fin
         if !soi[i].is_finite() || !iq[i].is_finite() || !rpm[i].is_finite() { continue; }
         let dur = model_duration_deg(iq[i], rpm[i]);
         let eoi_atdc = -(soi[i] - dur);
-        if eoi_atdc > CAPS.eoi_max_atdc && eoi_atdc > worst {
-            worst = eoi_atdc;
-        }
+        if eoi_atdc > CAPS.eoi_max_atdc && eoi_atdc > worst { worst = eoi_atdc; }
     }
     if !worst.is_finite() { return vec![]; }
     vec![one(
@@ -606,16 +736,16 @@ pub fn r10_eoi_late(log: &ResampledLog, pull: &Pull, _low_rate: bool) -> Vec<Fin
     )]
 }
 
-/// R11 — Coolant < 80 °C during pull.
+/// R11 — Coolant < `coolant_pull_min_c` during pull.
 pub fn r11_coolant_low(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     if !log.has("coolant_c") {
         return vec![make_skipped(&R11, pull, "channel coolant_c missing")];
     }
     let c = match slice(log, pull, "coolant_c") { Some(v) => v, None => return vec![] };
     let min = finite_min(c).unwrap_or(f64::INFINITY);
-    if min >= 80.0 { return vec![]; }
+    if min >= CAPS.coolant_pull_min_c { return vec![]; }
     vec![one(
-        &R11, pull, Severity::Info, min, 80.0,
+        &R11, pull, Severity::Info, min, CAPS.coolant_pull_min_c,
         R11.rationale_one_liner, None,
     )]
 }
@@ -689,17 +819,8 @@ pub fn r15_limp(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     )]
 }
 
-// ---------------------------------------------------------------------------
-// v3 EGR-delete rule predicates
-// ---------------------------------------------------------------------------
-
-/// R16 — Any sample with EGR duty > 2 % anywhere in the log (not just
-/// the pull). Evaluated against the entire log on the first pull only,
-/// so the same finding is not duplicated per pull.
+/// R16 — EGR duty observed anywhere in the log (global scope).
 pub fn r16_egr_observed(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
-    if pull.pull_id != 1 {
-        return vec![];
-    }
     if !log.has("egr_duty") {
         return vec![make_skipped(&R16, pull, "channel egr_duty missing")];
     }
@@ -714,19 +835,27 @@ pub fn r16_egr_observed(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
         &R16, pull, Severity::Critical,
         max_observed, EGR_DUTY_OBSERVED_TOLERANCE_PCT,
         R16.rationale_one_liner,
-        Some("AGR_arwMEAB0KL: zero all cells in both banks; arwMLGRDKF: ≥850 mg/stroke."),
+        Some("AGR_arwMEAB0KL + AGR_arwMEAB1KL: zero both banks; arwMLGRDKF: ≥850 mg/stroke."),
     )]
 }
 
-/// R17 — MAF deviation > 15 % sustained for > 2 s at warm cruise.
+/// R17 — MAF deviation > 15 % sustained for > 2 s at warm cruise. Reads
+/// `pedal_pct` (driver-wish), NOT `tps_pct` (anti-shudder valve). When
+/// `pedal_pct` is missing, R17 is fail-safe SKIPPED rather than firing.
 pub fn r17_maf_deviation(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     if !has_all(log, &["maf_actual", "maf_spec"]) {
         return vec![make_skipped(&R17, pull, "channels maf_actual/maf_spec missing")];
     }
+    if !log.has("pedal_pct") {
+        return vec![make_skipped(
+            &R17, pull,
+            "pedal_pct channel missing — refusing to fire (would false-positive at WOT without driver-wish)",
+        )];
+    }
     let actual = match slice(log, pull, "maf_actual") { Some(v) => v, None => return vec![] };
     let spec = match slice(log, pull, "maf_spec") { Some(v) => v, None => return vec![] };
     let coolant = slice(log, pull, "coolant_c");
-    let pedal = slice(log, pull, "tps_pct");
+    let pedal = match slice(log, pull, "pedal_pct") { Some(v) => v, None => return vec![] };
     let times = slice_time(log, pull);
 
     let n = actual.len();
@@ -737,16 +866,11 @@ pub fn r17_maf_deviation(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     let mut breach = vec![false; n];
     let mut worst: f64 = 0.0;
     for i in 0..n {
-        // Apply cold-start and WOT exclusions.
         if let Some(c) = coolant {
-            if c[i].is_finite() && c[i] < COLD_START_COOLANT_CUTOFF_C { continue; }
+            if c[i].is_finite() && c[i] < CAPS.warm_coolant_min_c { continue; }
         }
-        if let Some(p) = pedal {
-            if p[i].is_finite() && p[i] >= WOT_PEDAL_CUTOFF_PCT { continue; }
-        }
-        if !actual[i].is_finite() || !spec[i].is_finite() || spec[i] <= 0.0 {
-            continue;
-        }
+        if pedal[i].is_finite() && pedal[i] >= WOT_PEDAL_CUTOFF_PCT { continue; }
+        if !actual[i].is_finite() || !spec[i].is_finite() || spec[i] <= 0.0 { continue; }
         let deviation = (actual[i] - spec[i]).abs() / spec[i];
         if deviation > MAF_DEVIATION_FRACTION {
             breach[i] = true;
@@ -774,44 +898,6 @@ pub fn r17_maf_deviation(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     )]
 }
 
-/// R17b — MAF actual exceeds spec by ≥50 mg with EGR=0 → info, "delete
-/// is functional". Only fires when R17 does not (i.e. positive excess
-/// is fine; negative-or-symmetric deviation is what R17 catches).
-pub fn r17b_maf_excess_info(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
-    if !has_all(log, &["maf_actual", "maf_spec", "egr_duty"]) {
-        return vec![make_skipped(
-            &R17B, pull, "channels maf_actual/maf_spec/egr_duty missing",
-        )];
-    }
-    let actual = match slice(log, pull, "maf_actual") { Some(v) => v, None => return vec![] };
-    let spec = match slice(log, pull, "maf_spec") { Some(v) => v, None => return vec![] };
-    let egr = match slice(log, pull, "egr_duty") { Some(v) => v, None => return vec![] };
-
-    let mut max_excess: f64 = 0.0;
-    let mut any = false;
-    for i in 0..actual.len() {
-        if !actual[i].is_finite() || !spec[i].is_finite() || !egr[i].is_finite() {
-            continue;
-        }
-        if egr[i] > EGR_DUTY_OBSERVED_TOLERANCE_PCT {
-            // Don't claim "delete functional" when EGR is still active.
-            return vec![];
-        }
-        let excess = actual[i] - spec[i];
-        if excess >= MAF_EXCESS_INFO_MG {
-            any = true;
-            if excess > max_excess { max_excess = excess; }
-        }
-    }
-    if !any { return vec![]; }
-    vec![one(
-        &R17B, pull, Severity::Info,
-        max_excess, MAF_EXCESS_INFO_MG,
-        R17B.rationale_one_liner,
-        None,
-    )]
-}
-
 /// R18 — Cruise-band SOI is at or above stock (within ±0.2°) AND
 /// EGR=0 → info, recommend the −1.0° NVH retard.
 pub fn r18_cruise_nvh(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
@@ -823,7 +909,7 @@ pub fn r18_cruise_nvh(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     let rpm = match slice(log, pull, "rpm") { Some(v) => v, None => return vec![] };
     let iq = match slice(log, pull, "iq_requested") { Some(v) => v, None => return vec![] };
     let coolant = slice(log, pull, "coolant_c");
-    let pedal = slice(log, pull, "tps_pct");
+    let pedal = slice(log, pull, "pedal_pct");
 
     let mut samples_in_band = 0usize;
     let mut soi_at_or_above_stock = 0usize;
@@ -834,26 +920,16 @@ pub fn r18_cruise_nvh(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
         if egr[i] > EGR_DUTY_OBSERVED_TOLERANCE_PCT { continue; }
         if !in_cruise_band(rpm[i], iq[i]) { continue; }
         if let Some(c) = coolant {
-            if c[i].is_finite() && c[i] < WARM_COOLANT_MIN_C { continue; }
+            if c[i].is_finite() && c[i] < CAPS.warm_coolant_min_c { continue; }
         }
         if let Some(p) = pedal {
             if p[i].is_finite() && p[i] > CRUISE_PEDAL_MAX_PCT { continue; }
         }
         samples_in_band += 1;
-        // Stock cruise SOI is roughly 18-22° BTDC; "at or above stock"
-        // here is a stand-in for "no retard applied yet". Use 18° as the
-        // floor so any value at-or-above counts.
-        if soi[i] >= 18.0 - 0.2 {
-            soi_at_or_above_stock += 1;
-        }
+        if soi[i] >= 18.0 - 0.2 { soi_at_or_above_stock += 1; }
     }
-    if samples_in_band == 0 || soi_at_or_above_stock == 0 {
-        return vec![];
-    }
-    // Fire if a clear majority of the cruise samples show stock-or-above SOI.
-    if soi_at_or_above_stock * 2 < samples_in_band {
-        return vec![];
-    }
+    if samples_in_band == 0 || soi_at_or_above_stock == 0 { return vec![]; }
+    if soi_at_or_above_stock * 2 < samples_in_band { return vec![]; }
     vec![one(
         &R18, pull, Severity::Info,
         soi_at_or_above_stock as f64, samples_in_band as f64,
@@ -862,74 +938,194 @@ pub fn r18_cruise_nvh(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     )]
 }
 
-/// R19 — DTC scan: any P0401..P0406 in `dtc_codes`.
-pub fn r19_dtc_scan(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
-    if pull.pull_id != 1 {
-        return vec![];
+/// R19 — DTC scan from sidecar file. Global scope. `dtcs` is the parsed
+/// `Vec<String>` from `<base>.dtc.txt` (see [`crate::ingest::dtc`]).
+/// Returns SKIPPED when the sidecar is absent / empty.
+pub fn r19_dtc_scan(dtcs: &[String], pull: &Pull) -> Vec<Finding> {
+    if dtcs.is_empty() {
+        return vec![make_skipped(&R19, pull, "no DTC scan provided (sidecar missing or empty)")];
     }
-    if !log.data.contains_key("dtc_codes") {
-        return vec![make_skipped(&R19, pull, "channel dtc_codes missing")];
-    }
-    // dtc_codes is encoded as one numeric value per sample where each row
-    // is the integer suffix of a Pxxx code (e.g. 401 for P0401). Channels
-    // are floats so we represent absent as NaN.
-    let dtc = match log.get("dtc_codes") { Some(v) => v, None => return vec![] };
-    let observed: Vec<u16> = dtc.iter().copied()
-        .filter(|x| x.is_finite())
-        .map(|x| x.round() as u16)
-        .collect();
-    if observed.is_empty() {
-        return vec![];
-    }
-    // Map to P-codes and filter.
     let suspect: Vec<&'static str> = DTC_LIST_TO_SUPPRESS.iter()
         .copied()
-        .filter(|code| {
-            let n: u16 = code[1..].parse().unwrap_or(0);
-            observed.contains(&n)
-        })
+        .filter(|code| dtcs.iter().any(|d| d.eq_ignore_ascii_case(code)))
         .collect();
-    if suspect.is_empty() {
-        return vec![];
-    }
+    if suspect.is_empty() { return vec![]; }
     let wiring_fault = suspect.iter().any(|c| DTC_WIRING_FAULTS.contains(c));
+    let group_b_only = suspect.iter().all(|c| DTC_GROUP_B.contains(c));
     let action = if wiring_fault {
-        "P0403 → real solenoid wiring fault, investigate before suppressing."
+        "P0403 → real EGR solenoid wiring fault, investigate before suppressing."
+    } else if group_b_only {
+        "P0404/P0405/P0406 should not appear on AMF — verify DAMOS code-list and ECU file."
     } else {
         "DTC_thresholds: widen P0401/P0402 plausibility windows (or zero enable flags)."
     };
+    let rationale = format!(
+        "{} (observed: {})",
+        R19.rationale_one_liner,
+        suspect.join(", "),
+    );
     vec![one(
         &R19, pull, Severity::Warn,
         suspect.len() as f64, 0.0,
-        R19.rationale_one_liner,
+        &rationale,
         Some(action),
     )]
 }
 
-/// Dispatch one rule against one pull, honouring the `LOW_RATE` flag for
-/// rules that downgrade on slow logs.
-pub fn dispatch(rule: &Rule, log: &ResampledLog, pull: &Pull, low_rate: bool) -> Vec<Finding> {
-    match rule.id {
-        "R01" => r01_underboost(log, pull),
-        "R02" => r02_overboost_spike(log, pull),
-        "R03" => r03_boost_target_excessive(log, pull),
-        "R04" => r04_no_taper(log, pull),
-        "R05" => r05_maf_below_spec(log, pull),
-        "R06" => r06_lambda_floor(log, pull),
-        "R07" => r07_peak_iq(log, pull),
-        "R08" => r08_torque_ceiling(log, pull),
-        "R09" => r09_soi_excess(log, pull, low_rate),
-        "R10" => r10_eoi_late(log, pull, low_rate),
-        "R11" => r11_coolant_low(log, pull),
-        "R12" => r12_no_atm(log, pull),
-        "R13" => r13_fuel_temp(log, pull),
-        "R14" => r14_srcv(log, pull),
-        "R15" => r15_limp(log, pull),
-        "R16" => r16_egr_observed(log, pull),
-        "R17" => r17_maf_deviation(log, pull),
-        "R17b" => r17b_maf_excess_info(log, pull),
-        "R18" => r18_cruise_nvh(log, pull),
-        "R19" => r19_dtc_scan(log, pull),
-        _ => Vec::new(),
+/// R20 — MAF actual exceeds spec by ≥50 mg with EGR=0 (was R17b).
+pub fn r20_maf_excess_info(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
+    if !has_all(log, &["maf_actual", "maf_spec", "egr_duty"]) {
+        return vec![make_skipped(
+            &R20, pull, "channels maf_actual/maf_spec/egr_duty missing",
+        )];
+    }
+    let actual = match slice(log, pull, "maf_actual") { Some(v) => v, None => return vec![] };
+    let spec = match slice(log, pull, "maf_spec") { Some(v) => v, None => return vec![] };
+    let egr = match slice(log, pull, "egr_duty") { Some(v) => v, None => return vec![] };
+
+    let mut max_excess: f64 = 0.0;
+    let mut any = false;
+    for i in 0..actual.len() {
+        if !actual[i].is_finite() || !spec[i].is_finite() || !egr[i].is_finite() { continue; }
+        if egr[i] > EGR_DUTY_OBSERVED_TOLERANCE_PCT { return vec![]; }
+        let excess = actual[i] - spec[i];
+        if excess >= MAF_EXCESS_INFO_MG {
+            any = true;
+            if excess > max_excess { max_excess = excess; }
+        }
+    }
+    if !any { return vec![]; }
+    vec![one(
+        &R20, pull, Severity::Info,
+        max_excess, MAF_EXCESS_INFO_MG,
+        R20.rationale_one_liner,
+        None,
+    )]
+}
+
+/// R21 — Idle stability. Global scope; evaluates every warm-idle window
+/// (coolant ≥ warm threshold, pedal ≤ idle, vehicle_speed = 0 if known).
+/// Severity Warn at σ > 25; downgrades to Info if window < 30 s OR
+/// σ > 15 (stricter screening).
+pub fn r21_idle_stability(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
+    if !has_all(log, &["rpm", "coolant_c"]) {
+        return vec![make_skipped(&R21, pull, "channels rpm/coolant_c missing")];
+    }
+    let rpm = match log.get("rpm") { Some(v) => v, None => return vec![] };
+    let coolant = match log.get("coolant_c") { Some(v) => v, None => return vec![] };
+    let pedal = log.get("pedal_pct");
+    let speed = log.get("vehicle_speed");
+    let iq = log.get("iq_requested").or_else(|| log.get("iq_actual"));
+
+    let n = log.time.len();
+    if n == 0 { return vec![]; }
+
+    // Collect contiguous warm-idle samples: pedal ≤ IDLE_PEDAL_MAX_PCT,
+    // VSS = 0 if available, IQ ≤ IDLE_IQ_MAX_MG fallback when no pedal.
+    let mut idle_rpm: Vec<f64> = Vec::new();
+    let mut window_seconds: f64 = 0.0;
+    let times = log.time.as_slice();
+    let mut last_t: Option<f64> = None;
+
+    for i in 0..n {
+        if !rpm[i].is_finite() { continue; }
+        if i >= coolant.len() || !coolant[i].is_finite() || coolant[i] < CAPS.warm_coolant_min_c {
+            continue;
+        }
+        let pedal_ok = match pedal {
+            Some(p) if i < p.len() && p[i].is_finite() => p[i] <= IDLE_PEDAL_MAX_PCT,
+            _ => match iq {
+                Some(q) if i < q.len() && q[i].is_finite() => q[i] <= 8.0,
+                _ => true,
+            },
+        };
+        if !pedal_ok { continue; }
+        if let Some(s) = speed {
+            if i < s.len() && s[i].is_finite() && s[i] > 1.0 { continue; }
+        }
+        idle_rpm.push(rpm[i]);
+        if let Some(prev) = last_t {
+            let dt = times[i] - prev;
+            if dt.is_finite() && (0.0..1.0).contains(&dt) {
+                window_seconds += dt;
+            }
+        }
+        last_t = Some(times[i]);
+    }
+
+    if idle_rpm.is_empty() { return vec![]; }
+    let Some((_, std)) = finite_mean_std(&idle_rpm) else { return vec![]; };
+
+    if std <= IDLE_INSTABILITY_INFO_RPM_STD { return vec![]; }
+
+    let severity = if std > IDLE_INSTABILITY_THRESHOLD_RPM_STD && window_seconds >= IDLE_WINDOW_MIN_S {
+        Severity::Warn
+    } else {
+        Severity::Info
+    };
+    let threshold = if matches!(severity, Severity::Warn) {
+        IDLE_INSTABILITY_THRESHOLD_RPM_STD
+    } else {
+        IDLE_INSTABILITY_INFO_RPM_STD
+    };
+    let extra = if window_seconds < IDLE_WINDOW_MIN_S {
+        format!(
+            " (window {window_seconds:.1}s < {IDLE_WINDOW_MIN_S:.0}s — downgraded to info)"
+        )
+    } else {
+        String::new()
+    };
+    let rationale = format!("{}{extra}", R21.rationale_one_liner);
+    vec![one(
+        &R21, pull, severity, std, threshold, &rationale,
+        Some("Idle_fuel: −1.5 mg/stroke at warm idle (only when R21 fires)."),
+    )]
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch — exhaustive over `RuleId`.
+// ---------------------------------------------------------------------------
+
+/// Dispatch one rule against one pull (or the synthetic global pull),
+/// honouring the LOW_RATE flag for rules that downgrade on slow logs.
+pub fn dispatch(
+    rule: &Rule,
+    log: &ResampledLog,
+    dtcs: &[String],
+    pull: &Pull,
+    low_rate: bool,
+) -> Vec<Finding> {
+    let id = match rule.id {
+        "R01" => RuleId::R01, "R02" => RuleId::R02, "R03" => RuleId::R03,
+        "R04" => RuleId::R04, "R05" => RuleId::R05, "R06" => RuleId::R06,
+        "R07" => RuleId::R07, "R08" => RuleId::R08, "R09" => RuleId::R09,
+        "R10" => RuleId::R10, "R11" => RuleId::R11, "R12" => RuleId::R12,
+        "R13" => RuleId::R13, "R14" => RuleId::R14, "R15" => RuleId::R15,
+        "R16" => RuleId::R16, "R17" => RuleId::R17, "R18" => RuleId::R18,
+        "R19" => RuleId::R19, "R20" => RuleId::R20, "R21" => RuleId::R21,
+        _ => return Vec::new(),
+    };
+    match id {
+        RuleId::R01 => r01_underboost(log, pull),
+        RuleId::R02 => r02_overboost_spike(log, pull),
+        RuleId::R03 => r03_boost_target_excessive(log, pull),
+        RuleId::R04 => r04_no_taper(log, pull),
+        RuleId::R05 => r05_maf_below_spec(log, pull),
+        RuleId::R06 => r06_lambda_floor(log, pull),
+        RuleId::R07 => r07_peak_iq(log, pull),
+        RuleId::R08 => r08_torque_ceiling(log, pull),
+        RuleId::R09 => r09_soi_excess(log, pull, low_rate),
+        RuleId::R10 => r10_eoi_late(log, pull),
+        RuleId::R11 => r11_coolant_low(log, pull),
+        RuleId::R12 => r12_no_atm(log, pull),
+        RuleId::R13 => r13_fuel_temp(log, pull),
+        RuleId::R14 => r14_srcv(log, pull),
+        RuleId::R15 => r15_limp(log, pull),
+        RuleId::R16 => r16_egr_observed(log, pull),
+        RuleId::R17 => r17_maf_deviation(log, pull),
+        RuleId::R18 => r18_cruise_nvh(log, pull),
+        RuleId::R19 => r19_dtc_scan(dtcs, pull),
+        RuleId::R20 => r20_maf_excess_info(log, pull),
+        RuleId::R21 => r21_idle_stability(log, pull),
     }
 }

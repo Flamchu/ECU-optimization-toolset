@@ -1,9 +1,11 @@
-//! `Rule`, `Finding`, `Severity` — base types for the AMF rule pack.
+//! `Rule`, `Finding`, `Severity`, `RuleScope`, `make_skipped` — base
+//! types for the AMF rule pack (lives here, not in `runner.rs`, per
+//! v4 fix T).
 //!
-//! Per spec §4.3: every rule carries an `id`, a `severity`, a one-line
+//! Per spec §6: every rule carries an `id`, a `severity`, a one-line
 //! rationale, and an optional reference to a row in the default-deltas
-//! table. Predicates evaluate per WOT pull and return zero or more
-//! `Finding`s.
+//! table. Predicates evaluate per pull (or once globally) and return
+//! zero or more `Finding`s.
 
 use crate::util::Pull;
 
@@ -29,18 +31,31 @@ impl Severity {
     }
 }
 
-/// One rule firing on one pull (or a skipped placeholder).
+/// Where in the analysis a rule fires.
+///
+/// `PerPull` rules are evaluated once per detected WOT pull. `Global`
+/// rules are evaluated exactly once over the whole log (R16 EGR observed,
+/// R19 DTC scan, R21 idle stability) — their findings carry pull id 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleScope {
+    /// Evaluate once per detected WOT pull.
+    PerPull,
+    /// Evaluate exactly once over the whole log.
+    Global,
+}
+
+/// One rule firing on one pull (or a global / skipped placeholder).
 #[derive(Debug, Clone)]
 pub struct Finding {
     /// Rule id (e.g. `"R02"`).
     pub rule_id: &'static str,
     /// Severity at which this finding fired (rules can downgrade).
     pub severity: Severity,
-    /// Pull id this finding belongs to.
+    /// Pull id this finding belongs to (0 for global-scope findings).
     pub pull_id: u32,
-    /// Pull start time (seconds).
+    /// Pull start time (seconds; 0 for global findings).
     pub t_start: f64,
-    /// Pull end time (seconds).
+    /// Pull end time (seconds; log-end for global findings).
     pub t_end: f64,
     /// Most-extreme observed value that triggered the rule. Units are
     /// rule-dependent.
@@ -82,6 +97,8 @@ pub struct Rule {
     pub id: &'static str,
     /// Default severity.
     pub severity: Severity,
+    /// Where this rule evaluates (per-pull or global).
+    pub scope: RuleScope,
     /// One-line rationale.
     pub rationale_one_liner: &'static str,
     /// Default-deltas key, if any.
@@ -105,5 +122,19 @@ pub fn make_skipped(rule: &Rule, pull: &Pull, reason: &str) -> Finding {
         rationale: format!("SKIPPED — {reason}"),
         recommended_action_ref: rule.recommended_delta_ref.map(str::to_string),
         skipped: true,
+    }
+}
+
+/// Synthetic pull spanning the whole log — used to evaluate `Global`
+/// rules. Pull id 0 marks it as non-physical.
+pub fn synthetic_global_pull(log_len_samples: usize, t_start: f64, t_end: f64) -> Pull {
+    Pull {
+        pull_id: 0,
+        i_start: 0,
+        i_end: log_len_samples,
+        t_start,
+        t_end,
+        rpm_start: 0.0,
+        rpm_end: 0.0,
     }
 }
