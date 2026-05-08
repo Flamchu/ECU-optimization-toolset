@@ -1,4 +1,4 @@
-//! Hard guardrails per spec §5 — the "sane Stage 1" envelope.
+//! Hard guardrails per spec §7 — the "sane Stage 1" envelope (v4).
 //!
 //! Every recommendation passes through one of the `clamp_*` functions
 //! before reaching the report. If a delta would push the resulting value
@@ -8,74 +8,102 @@
 //! Each cap below has a documented physical/longevity reason — never
 //! raise one without updating the rationale alongside it.
 
-/// Diesel stoichiometric AFR. Used in the lambda model
-/// (lambda = MAF / (IQ * 14.5)).
+/// Diesel stoichiometric AFR (kg air / kg fuel). Industry consensus: 14.5
+/// (acceptable band 14.4–14.6). Used in the lambda model
+/// (lambda = MAF / (IQ × 14.5)).
 pub const DIESEL_AFR_STOICH: f64 = 14.5;
 
 /// Modelled-torque conversion (re-exported from `stock_refs` for ergonomics).
+/// Calibration-tuned engineering constant: 44.5 mg × 4.4 ≈ 195 Nm stock.
 pub const NM_PER_MG_IQ: f64 = super::stock_refs::NM_PER_MG_IQ;
 
 /// Numeric envelope caps. Values are absolute caps the tool must NEVER
 /// exceed.
 #[derive(Debug, Clone, Copy)]
 pub struct EnvelopeCaps {
-    /// Right edge of efficient compressor map, mbar absolute.
+    /// Right edge of the GT1544S efficient compressor map (mbar absolute).
     pub peak_boost_mbar_abs: i32,
-    /// Tighter cap above 4000 rpm; KP35 chokes there.
+    /// Tighter cap above 4000 rpm: GT1544S compressor map narrows past
+    /// ~6 lb/min @ PR > 2.0 (choke flow + shaft overspeed risk).
     pub peak_boost_above_4000rpm_mbar_abs: i32,
 
-    /// Stock-injector duration headroom + LUK clutch torque ceiling.
+    /// PD75 nozzle duration headroom + LUK clutch torque ceiling.
     /// v3 raised from 52 mg/stroke (smoke removed → only injector-duty
-    /// + clutch matter).
+    /// + clutch matter); v4 keeps 54 mg/str.
     pub peak_iq_mg: f64,
-    /// Lambda floor; v3 relaxed from 1.20 to 1.05 (smoke-tolerant
-    /// controlled-environment context). Below 1.0 is past stoich →
-    /// incomplete combustion → EGT spike → ring-land cracks.
+    /// Lambda floor for a diesel screening tool.
+    /// Industry consensus: below λ ≈ 1.05 you get incomplete combustion,
+    /// soot ramp, EGT spike. Unified at 1.05 (was inconsistent 1.05/1.20
+    /// across v3 modules).
     pub lambda_floor: f64,
-    /// Cast-iron manifold creep + AMF has no oil-jet pistons.
+    /// Cast-iron manifold creep onset ≥750 °C; 800 °C sustained binding cap.
+    /// Pistons have no oil cooling jets on AMF, which makes this load-bearing.
     pub pre_turbo_egt_c_sustained: i32,
 
-    /// SOI advance cap (deg BTDC) at IQ >= `soi_iq_threshold_mg`.
+    /// SOI advance cap (deg BTDC) at IQ ≥ `soi_iq_threshold_mg`.
     pub soi_max_btdc: f64,
-    /// IQ at and above which the SOI cap kicks in.
+    /// IQ at and above which the SOI cap kicks in (cruise / cold maps may
+    /// run more advanced below this).
     pub soi_iq_threshold_mg: f64,
     /// EOI cap (deg ATDC); past this, heat dumps into the turbine.
     pub eoi_max_atdc: f64,
 
-    /// LUK SMF clutch ceiling (Nm flywheel).
+    /// LUK SMF clutch ceiling (Nm flywheel). Engineering judgement (LUK
+    /// does not publish a torque rating for the OE diesel SMF on this
+    /// platform).
     pub modelled_flywheel_torque_nm: f64,
 
-    /// HFM5 non-linear above this MAF reading.
+    /// ECU map quantisation ceiling (mg/stroke). NOT a Bosch HFM5 sensor
+    /// saturation point (HFM5 itself does not saturate on AMF airflow);
+    /// this is the Strategy-B safe envelope on the EDC15P+ map tables.
     pub maf_max_mg_stroke: f64,
+
+    /// Strategy-B fill value for the spec-MAF map (mg/stroke). Canonical
+    /// Bosch HFM5 calibration target at 3000 rpm WOT for the 1.9 R4 PD
+    /// family; AMF inherits the same target. Saturating arwMLGRDKF here
+    /// guarantees `MAF_actual − MAF_spec` is never positive so the EGR
+    /// PID never demands EGR.
+    pub spec_maf_fill_mg_stroke: f64,
 
     /// SVBL change cap — never touch the overboost cut.
     pub svbl_change_mbar: i32,
 
-    // --- v3 EGR-delete envelope additions -------------------------------
     /// Maximum permitted EGR duty (%) in any recommended map. Mandatory
-    /// software EGR delete: every cell must be 0%.
+    /// software EGR delete: every cell must be 0 %.
     pub egr_duty_max_pct: f64,
-    /// Strategy-B fill value for the spec-MAF map (mg/stroke). Saturates
-    /// the map so `MAF_actual − MAF_spec` is never positive and the EGR
-    /// PID never demands EGR.
-    pub spec_maf_fill_mg_stroke: f64,
+
+    /// Coolant minimum (°C) for "warm pull" (R11 — invalidate the pull
+    /// otherwise; cold SOI map is in play below).
+    pub coolant_pull_min_c: f64,
+    /// Coolant minimum (°C) for "warm cruise / warm idle" (R17 / R18 / R21).
+    /// Lower than `coolant_pull_min_c` because cruise/idle screening only
+    /// needs the engine off the cold-start map.
+    pub warm_coolant_min_c: f64,
+
+    /// Pedal threshold (%) for WOT pull detection. VCDS pedal channel
+    /// rounds to 1 % steps; 95 % robustly excludes "near-WOT" coast-up.
+    pub pedal_wot_pct: f64,
 }
 
-/// Canonical, frozen instance of [`EnvelopeCaps`] (v3 EGR-delete edition).
+/// Canonical, frozen instance of [`EnvelopeCaps`] (v4 audit-reconciled
+/// edition).
 pub const CAPS: EnvelopeCaps = EnvelopeCaps {
     peak_boost_mbar_abs: 2150,
     peak_boost_above_4000rpm_mbar_abs: 2050,
-    peak_iq_mg: 54.0,         // v3: was 52 in v2
-    lambda_floor: 1.05,       // v3: was 1.20 in v2
+    peak_iq_mg: 54.0,
+    lambda_floor: 1.05,
     pre_turbo_egt_c_sustained: 800,
     soi_max_btdc: 26.0,
     soi_iq_threshold_mg: 30.0,
     eoi_max_atdc: 10.0,
     modelled_flywheel_torque_nm: 240.0,
     maf_max_mg_stroke: 1000.0,
+    spec_maf_fill_mg_stroke: 850.0,
     svbl_change_mbar: 0,
     egr_duty_max_pct: 0.0,
-    spec_maf_fill_mg_stroke: 850.0,
+    coolant_pull_min_c: 80.0,
+    warm_coolant_min_c: 70.0,
+    pedal_wot_pct: 95.0,
 };
 
 /// Result of running a single proposed value through the envelope.
@@ -109,8 +137,8 @@ pub fn clamp_boost_target(proposed_mbar_abs: f64, rpm: f64) -> ClampOutcome {
             f64::from(CAPS.peak_boost_above_4000rpm_mbar_abs),
             "peak_boost_above_4000rpm_mbar_abs",
             format!(
-                "KP35 chokes above 4000 rpm; sustained PR > 2.0 over-speeds the shaft. \
-                 Capped at {} mbar abs.",
+                "Garrett GT1544S compressor map narrows above 4000 rpm; sustained PR > 2.0 \
+                 risks shaft overspeed. Capped at {} mbar abs.",
                 CAPS.peak_boost_above_4000rpm_mbar_abs
             ),
         );
@@ -120,7 +148,7 @@ pub fn clamp_boost_target(proposed_mbar_abs: f64, rpm: f64) -> ClampOutcome {
             f64::from(CAPS.peak_boost_mbar_abs),
             "peak_boost_mbar_abs",
             format!(
-                "Right edge of KP35 efficient compressor map at AMF flow rates. \
+                "Right edge of Garrett GT1544S efficient compressor map at AMF flow rates. \
                  Capped at {} mbar abs.",
                 CAPS.peak_boost_mbar_abs
             ),
@@ -129,14 +157,15 @@ pub fn clamp_boost_target(proposed_mbar_abs: f64, rpm: f64) -> ClampOutcome {
     ClampOutcome::ok(proposed_mbar_abs)
 }
 
-/// Cap requested IQ by the stock-injector + LUK clutch ceiling.
+/// Cap requested IQ by the PD75 injector duration headroom + LUK clutch
+/// ceiling.
 pub fn clamp_iq(proposed_mg: f64) -> ClampOutcome {
     if proposed_mg > CAPS.peak_iq_mg {
         return ClampOutcome::blocked(
             CAPS.peak_iq_mg,
             "peak_iq_mg",
             format!(
-                "Stock injector duration headroom + LUK clutch torque ceiling. \
+                "PD75 nozzle duration headroom + LUK clutch torque ceiling. \
                  Capped at {} mg/stroke.",
                 CAPS.peak_iq_mg
             ),
@@ -147,15 +176,19 @@ pub fn clamp_iq(proposed_mg: f64) -> ClampOutcome {
 
 /// Cap SOI advance.
 ///
-/// Below the IQ threshold there is more thermal margin and slightly more
-/// advance is survivable, but for safety the cap is applied at every IQ.
-pub fn clamp_soi(proposed_btdc: f64, _iq_mg: f64) -> ClampOutcome {
+/// At IQ below `soi_iq_threshold_mg` (cruise / cold start) more advance is
+/// thermally survivable, so SOI is returned unchanged. At and above the
+/// threshold the cap of `soi_max_btdc` is enforced.
+pub fn clamp_soi(proposed_btdc: f64, iq_mg: f64) -> ClampOutcome {
+    if iq_mg < CAPS.soi_iq_threshold_mg {
+        return ClampOutcome::ok(proposed_btdc);
+    }
     if proposed_btdc > CAPS.soi_max_btdc {
         return ClampOutcome::blocked(
             CAPS.soi_max_btdc,
             "soi_max_btdc",
             format!(
-                "At IQ >= {} mg, advance beyond {}° BTDC migrates peak cylinder \
+                "At IQ ≥ {} mg, advance beyond {}° BTDC migrates peak cylinder \
                  pressure ahead of TDC and stresses the unjacketed pistons. \
                  Capped at {}° BTDC.",
                 CAPS.soi_iq_threshold_mg, CAPS.soi_max_btdc, CAPS.soi_max_btdc
@@ -172,8 +205,8 @@ pub fn clamp_torque_nm(proposed_nm: f64) -> ClampOutcome {
             CAPS.modelled_flywheel_torque_nm,
             "modelled_flywheel_torque_nm",
             format!(
-                "LUK SMF clutch ceiling (195 Nm rated × 1.23 headroom). \
-                 Capped at {} Nm.",
+                "LUK SMF clutch ceiling (engineering judgement: 195 Nm rated × 1.23 headroom; \
+                 LUK does not publish a torque rating for this OE clutch). Capped at {} Nm.",
                 CAPS.modelled_flywheel_torque_nm
             ),
         );
@@ -188,7 +221,7 @@ pub fn clamp_lambda_floor(proposed_lambda: f64) -> ClampOutcome {
             CAPS.lambda_floor,
             "lambda_floor",
             format!(
-                "Below λ = {} on PD = visible smoke + EGT spike + DPF/cat damage. \
+                "Below λ = {} on diesel = visible smoke + EGT spike + ring-land stress. \
                  Floor enforced.",
                 CAPS.lambda_floor
             ),
@@ -209,14 +242,14 @@ pub fn clamp_svbl(proposed_change_mbar: f64) -> ClampOutcome {
     ClampOutcome::ok(0.0)
 }
 
-/// Refuse any non-zero EGR duty in a recommended map. v3 software-delete
-/// is mandatory.
+/// Refuse any non-zero EGR duty in a recommended map. The v3/v4 software
+/// EGR delete is mandatory; mechanical hardware stays installed.
 pub fn clamp_egr_duty_pct(proposed_duty_pct: f64) -> ClampOutcome {
     if proposed_duty_pct.abs() > f64::EPSILON {
         return ClampOutcome::blocked(
             CAPS.egr_duty_max_pct,
             "egr_duty_max_pct",
-            "v3 mandates software EGR delete: EGR duty must be 0% in every \
+            "v4 mandates software EGR delete: EGR duty must be 0 % in every \
              recommended map cell. Mechanical EGR hardware stays installed; \
              only the duty map and spec-MAF map are flashed."
                 .to_string(),
@@ -234,9 +267,9 @@ pub fn clamp_spec_maf(proposed_mg_stroke: f64) -> ClampOutcome {
             CAPS.spec_maf_fill_mg_stroke,
             "spec_maf_fill_mg_stroke",
             format!(
-                "Spec-MAF cells must be ≥ {} mg/stroke (Strategy-B saturation) \
-                 so MAF_actual − MAF_spec is never positive and the EGR PID \
-                 never demands EGR.",
+                "Spec-MAF cells must be ≥ {} mg/stroke (canonical Bosch HFM5 calibration \
+                 target at 3000 rpm WOT). Saturating here makes MAF_actual − MAF_spec never \
+                 positive so the EGR PID never demands EGR.",
                 CAPS.spec_maf_fill_mg_stroke
             ),
         );
@@ -302,16 +335,31 @@ mod tests {
 
     #[test]
     fn iq_v2_old_cap_now_passes() {
-        // v2's 52 mg/stroke should no longer trigger.
         let r = clamp_iq(52.0);
         assert!(!r.blocked);
     }
 
     #[test]
-    fn soi_above_cap_blocked() {
+    fn soi_above_cap_blocked_at_high_iq() {
         let r = clamp_soi(28.0, 45.0);
         assert!(r.blocked);
         assert_eq!(r.value, 26.0);
+    }
+
+    #[test]
+    fn soi_below_threshold_iq_returns_unchanged() {
+        // v4 fix I: at IQ < 30 mg, SOI cap does not apply (cruise / cold).
+        let r = clamp_soi(28.0, 10.0);
+        assert!(!r.blocked);
+        assert_eq!(r.value, 28.0);
+    }
+
+    #[test]
+    fn soi_at_threshold_iq_clamps() {
+        // Boundary: iq_mg == 30.0 must enforce the cap.
+        let r = clamp_soi(28.0, 30.0);
+        assert!(r.blocked);
+        assert_eq!(r.value, CAPS.soi_max_btdc);
     }
 
     #[test]
@@ -323,20 +371,19 @@ mod tests {
 
     #[test]
     fn lambda_below_floor_blocked() {
-        // v3 floor is 1.05; below stoich is the new line.
         let r = clamp_lambda_floor(1.00);
         assert!(r.blocked);
     }
 
     #[test]
-    fn lambda_at_v3_floor_passes() {
+    fn lambda_at_v4_floor_passes() {
         let r = clamp_lambda_floor(1.05);
         assert!(!r.blocked);
     }
 
     #[test]
     fn lambda_at_v2_old_floor_now_passes() {
-        // v2's 1.20 used to be the floor; v3 relaxes to 1.05.
+        // v2's 1.20 used to be the floor; v3+v4 keep 1.05.
         let r = clamp_lambda_floor(1.10);
         assert!(!r.blocked);
     }
@@ -381,5 +428,19 @@ mod tests {
         let r = clamp_spec_maf(400.0);
         assert!(r.blocked);
         assert_eq!(r.value, 850.0);
+    }
+
+    #[test]
+    fn caps_lambda_floor_is_v4_canonical() {
+        // v4 acceptance #4: λ floor unified at 1.05 across the codebase.
+        assert!((CAPS.lambda_floor - 1.05).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn caps_coolant_constants_disambiguated() {
+        // v4 fix F + Y: pull-coolant minimum (80) and warm-cruise (70) split.
+        assert!((CAPS.coolant_pull_min_c - 80.0).abs() < f64::EPSILON);
+        assert!((CAPS.warm_coolant_min_c - 70.0).abs() < f64::EPSILON);
+        assert!(CAPS.coolant_pull_min_c > CAPS.warm_coolant_min_c);
     }
 }

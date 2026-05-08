@@ -13,7 +13,9 @@ pub struct BoostRefPoint {
     pub boost_mbar_abs: i32,
 }
 
-/// Boost target ramp — community-validated stock LDRXN curve for AMF.
+/// Boost target ramp — AMF wastegated GT1544S taper, derived from PD75
+/// family logs. v4 audit lowered the 4500 rpm cell to 1700 mbar abs to
+/// reflect the actual GT1544S choke-flow taper above ~3500 rpm.
 pub const STOCK_BOOST_RAMP: &[BoostRefPoint] = &[
     BoostRefPoint { rpm: 1300, boost_mbar_abs: 1100 },
     BoostRefPoint { rpm: 2000, boost_mbar_abs: 1900 },
@@ -21,7 +23,7 @@ pub const STOCK_BOOST_RAMP: &[BoostRefPoint] = &[
     BoostRefPoint { rpm: 3000, boost_mbar_abs: 2000 },
     BoostRefPoint { rpm: 3500, boost_mbar_abs: 1950 },
     BoostRefPoint { rpm: 4000, boost_mbar_abs: 1850 },
-    BoostRefPoint { rpm: 4500, boost_mbar_abs: 1750 },
+    BoostRefPoint { rpm: 4500, boost_mbar_abs: 1700 },
 ];
 
 /// Peak IQ curve — what stock LDRXN + smoke limit deliver, indexed by RPM.
@@ -109,7 +111,7 @@ mod tests {
 
     #[test]
     fn boost_above_last_anchor_clamps_to_last() {
-        assert!(approx(stock_boost_at_rpm(6000.0), 1750.0));
+        assert!(approx(stock_boost_at_rpm(6000.0), 1700.0));
     }
 
     #[test]

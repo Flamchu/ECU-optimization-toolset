@@ -1,10 +1,10 @@
 [package]
 name = "ecu-shenanigans"
-version = "2.0.0"
+version = "4.0.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Flamchu"]
-description = "VCDS datalog analyzer + sane Stage 1 recommendation engine for Skoda Fabia AMF / EDC15P+"
+description = "VCDS datalog analyzer + sane Stage 1 recommendation engine for Skoda Fabia AMF / EDC15P+ (Garrett GT1544S)"
 license = "MIT"
 repository = "https://github.com/Flamchu/ecu-shenanigans"
 readme = "README.md"

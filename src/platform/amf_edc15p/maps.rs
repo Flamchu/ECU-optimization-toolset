@@ -58,14 +58,14 @@ pub const MAPS: &[MapDef] = &[
         german_alias: "Begrenzungsmenge (MAF)",
         x_axis: "maf_mg", y_axis: "rpm",
         cell_unit: "mg/stroke", typical_dim: "13x16",
-        description: "Smoke limiter, MAF axis. Re-scale axis & enforce λ ≥ 1.20 everywhere.",
+        description: "Smoke limiter, MAF axis. Re-scale axis & enforce λ ≥ 1.05 everywhere.",
     },
     MapDef {
         name: "Smoke_IQ_by_MAP",
         german_alias: "Begrenzungsmenge (MAP)",
         x_axis: "boost_mbar", y_axis: "rpm",
         cell_unit: "mg/stroke", typical_dim: "11x16",
-        description: "Smoke limiter, MAP axis (active on AMF, switch byte = 257). Same lambda discipline.",
+        description: "Smoke limiter, MAP axis (parallel slice, switch byte selects). Same λ ≥ 1.05 discipline.",
     },
     MapDef {
         name: "Torque_Limiter",
@@ -114,7 +114,7 @@ pub const MAPS: &[MapDef] = &[
         german_alias: "Lambdawunsch / Rauchbegrenzung",
         x_axis: "maf_mg", y_axis: "rpm",
         cell_unit: "lambda", typical_dim: "13x16",
-        description: "Floor cells at λ = 1.20.",
+        description: "Floor cells at λ = 1.05.",
     },
     MapDef {
         name: "Atmospheric_correction",
@@ -130,20 +130,28 @@ pub const MAPS: &[MapDef] = &[
         cell_unit: "C", typical_dim: "varies",
         description: "EGT model / fuel cut on temp (where present). DO NOT RAISE — used as backstop.",
     },
-    // ---- v3 EGR-delete-specific symbolic maps ---------------------------
+    // ---- v3/v4 EGR-delete-specific symbolic maps ------------------------
     MapDef {
         name: "AGR_arwMEAB0KL",
-        german_alias: "Abgasrückführung Tastverhältnis",
+        german_alias: "Abgasrückführung Tastverhältnis (Bank A)",
         x_axis: "rpm", y_axis: "iq_mg",
         cell_unit: "% duty", typical_dim: "13x16",
-        description: "EGR-duty map (AGR). v3 mandate: zero all cells in both banks.",
+        description: "EGR-duty map bank A. v4 mandate: zero all cells.",
+    },
+    MapDef {
+        name: "AGR_arwMEAB1KL",
+        german_alias: "Abgasrückführung Tastverhältnis (Bank B)",
+        x_axis: "rpm", y_axis: "iq_mg",
+        cell_unit: "% duty", typical_dim: "13x16",
+        description: "EGR-duty map bank B (paired in DAMOS even on single-actuator PD ECUs). \
+                      v4 mandate: zero all cells — symmetry with bank A.",
     },
     MapDef {
         name: "arwMLGRDKF",
         german_alias: "Sollluftmasse / EGR target air mass",
         x_axis: "rpm", y_axis: "iq_mg",
         cell_unit: "mg/stroke", typical_dim: "16x10",
-        description: "Spec-MAF / expected air mass. v3 mandate: fill ≥850 mg/stroke (Strategy B).",
+        description: "Spec-MAF / expected air mass. v4 mandate: fill ≥850 mg/stroke (Strategy B).",
     },
     MapDef {
         name: "DTC_thresholds",
@@ -164,7 +172,7 @@ pub const MAPS: &[MapDef] = &[
         german_alias: "Leerlauf-Mengenkennfeld (Slice)",
         x_axis: "rpm", y_axis: "iq_mg",
         cell_unit: "mg/stroke", typical_dim: "varies",
-        description: "Idle fuelling slice. CONDITIONAL: trim only if R12 fires post-delete.",
+        description: "Idle fuelling slice. CONDITIONAL: trim only if R21 idle-stability fires.",
     },
     MapDef {
         name: "SOI_warm_cruise",
@@ -185,22 +193,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_v3_maps() {
-        // 15 v2 maps + 6 v3 EGR-delete-specific maps.
-        assert_eq!(MAPS.len(), 21);
+    fn registry_has_v4_22_maps() {
+        // 15 v2 maps + 7 v4 EGR-delete-specific maps (added arwMEAB1KL bank B).
+        assert_eq!(MAPS.len(), 22);
     }
 
     #[test]
-    fn v3_egr_maps_are_present() {
+    fn v4_egr_maps_are_present_both_banks() {
         for name in [
             "AGR_arwMEAB0KL",
+            "AGR_arwMEAB1KL",
             "arwMLGRDKF",
             "DTC_thresholds",
             "MAF_MAP_smoke_switch",
             "Idle_fuel",
             "SOI_warm_cruise",
         ] {
-            assert!(get_map(name).is_some(), "v3 map {name} must be in registry");
+            assert!(get_map(name).is_some(), "v4 map {name} must be in registry");
         }
     }
 
