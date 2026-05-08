@@ -2,6 +2,7 @@
 
 pub mod channels;
 pub mod default_deltas;
+pub mod egr;
 pub mod envelope;
 pub mod maps;
 pub mod stock_refs;

@@ -46,6 +46,8 @@ pub const CHANNELS: &[Channel] = &[
     Channel { name: "srcv_cyl2",      source: "013-2",                          unit: "mg/stroke", description: "smooth-running cyl 2" },
     Channel { name: "srcv_cyl3",      source: "013-3",                          unit: "mg/stroke", description: "smooth-running cyl 3 (AMF is 3-cyl)" },
     Channel { name: "fuel_temp_c",    source: "013-?",                          unit: "C",         description: "fuel temp on firmwares that expose it" },
+    Channel { name: "vehicle_speed",  source: "004-?",                          unit: "km/h",      description: "VSS for cruise / idle distinction" },
+    Channel { name: "dtc_codes",      source: "OBD scan",                       unit: "code",      description: "DTC strings (post-flash validation, R19)" },
 ];
 
 /// Channels we explicitly do not log (no factory sensor / not on KW1281).
