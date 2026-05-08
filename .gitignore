@@ -37,3 +37,6 @@ cobertura.xml
 # (Do NOT ignore tests/fixtures/*.csv — those are checked in.)
 /scratch/
 /tmp/
+
+# --- Dev-only documentation (not for the public repo) -----------------------
+/docs/dev/
