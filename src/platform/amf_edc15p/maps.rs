@@ -179,7 +179,32 @@ pub const MAPS: &[MapDef] = &[
         german_alias: "Spritzbeginn warm (Cruise-Band)",
         x_axis: "rpm", y_axis: "iq_mg",
         cell_unit: "deg BTDC", typical_dim: "10x16",
-        description: "Warm-cruise SOI band (1500-2500 rpm × 5-15 mg). v3: −1.0° NVH retard.",
+        description: "Warm-cruise SOI band (1500-2500 rpm × 5-15 mg). −1.0° NVH retard.",
+    },
+    // ---- Driveability + thermal symbolic maps ---------------------------
+    MapDef {
+        name: "Driver_Wish_low_pedal",
+        german_alias: "Fahrerwunsch (Pedal 1..25 %)",
+        x_axis: "pedal_pct", y_axis: "rpm",
+        cell_unit: "mg/stroke", typical_dim: "13x16 (community-reported, up to 9 parallel banks)",
+        description: "View of the Driver_Wish (Fahrerwunsch / mrwFVH_KF) restricted \
+                      to the 1..25 % pedal column band. Edits here flatten the off-idle \
+                      slope; mid- and high-pedal cells are not modified.",
+    },
+    MapDef {
+        name: "Fan_thresholds",
+        german_alias: "Lüfter Schwellenwerte (firmware-dependent)",
+        x_axis: "stage", y_axis: "_",
+        cell_unit: "°C", typical_dim: "stage-1 on/off, stage-2 on/off",
+        description: "Cooling-fan stage on/off thresholds. Symbolic only — actual DAMOS \
+                      naming is firmware-dependent on EDC15P+; locate against the AMF binary.",
+    },
+    MapDef {
+        name: "Fan_run_on",
+        german_alias: "Lüfter-Nachlauf (firmware-dependent)",
+        x_axis: "scalar", y_axis: "_",
+        cell_unit: "s", typical_dim: "scalar (or short LUT indexed by T_coolant at key-off)",
+        description: "Fan run-on time after key-off. Capped at the battery-protective ceiling.",
     },
 ];
 
@@ -193,13 +218,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_has_v4_22_maps() {
-        // 15 v2 maps + 7 v4 EGR-delete-specific maps (added arwMEAB1KL bank B).
-        assert_eq!(MAPS.len(), 22);
+    fn registry_has_25_maps() {
+        // 22 platform/EGR maps + 3 driveability/thermal symbolic maps.
+        assert_eq!(MAPS.len(), 25);
     }
 
     #[test]
-    fn v4_egr_maps_are_present_both_banks() {
+    fn egr_maps_are_present_both_banks() {
         for name in [
             "AGR_arwMEAB0KL",
             "AGR_arwMEAB1KL",
@@ -209,8 +234,29 @@ mod tests {
             "Idle_fuel",
             "SOI_warm_cruise",
         ] {
-            assert!(get_map(name).is_some(), "v4 map {name} must be in registry");
+            assert!(get_map(name).is_some(), "EGR map {name} must be in registry");
         }
+    }
+
+    #[test]
+    fn driveability_and_thermal_maps_are_present() {
+        for name in [
+            "Driver_Wish_low_pedal",
+            "Fan_thresholds",
+            "Fan_run_on",
+        ] {
+            assert!(get_map(name).is_some(),
+                "driveability/thermal map {name} must be in registry");
+        }
+    }
+
+    #[test]
+    fn map_ids_are_unique() {
+        let mut ids: Vec<&str> = MAPS.iter().map(|m| m.name).collect();
+        ids.sort_unstable();
+        let original_len = ids.len();
+        ids.dedup();
+        assert_eq!(original_len, ids.len(), "duplicate map id in registry");
     }
 
     #[test]

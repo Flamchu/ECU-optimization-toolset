@@ -14,8 +14,9 @@ use std::collections::BTreeSet;
 
 use crate::platform::amf_edc15p::default_deltas::{DefaultDelta, DeltaKind, DEFAULT_DELTAS};
 use crate::platform::amf_edc15p::envelope::{
-    clamp_boost_target, clamp_egr_duty_pct, clamp_iq, clamp_soi, clamp_spec_maf,
-    clamp_svbl, clamp_torque_nm, ClampOutcome, CAPS,
+    clamp_boost_target, clamp_egr_duty_pct, clamp_fan_on_c, clamp_fan_run_on_s, clamp_iq,
+    clamp_low_pedal_slope, clamp_soi, clamp_spec_maf, clamp_svbl, clamp_torque_nm,
+    ClampOutcome, CAPS,
 };
 use crate::platform::amf_edc15p::stock_refs::stock_boost_at_rpm;
 use crate::rules::base::{Finding, Severity};
@@ -258,6 +259,77 @@ fn eval_default(d: &DefaultDelta, firing: &BTreeSet<String>) -> Recommendation {
                 blocked_cap: None,
             }
         }
+        (DeltaKind::Flatten, value) => {
+            // Conditional driveability row. Only applies when its trigger
+            // rule fires; the engine routed us here only after the rule
+            // gate passed.
+            let target = value.unwrap_or(CAPS.low_pedal_slope_max_mg_per_pct);
+            let clamped = clamp_low_pedal_slope(target);
+            let action = format!(
+                "target slope ≤ {:.2} mg/stroke per pedal-percent across pedal {}-{} % \
+                 (idle creep ≤ {} % preserved)",
+                clamped,
+                CAPS.low_pedal_idle_creep_pct,
+                CAPS.low_pedal_band_top_pct,
+                CAPS.low_pedal_idle_creep_pct,
+            );
+            Recommendation {
+                map_name: d.map_name.to_string(),
+                cell_selector: d.cell_selector.to_string(),
+                status: Status::Apply,
+                proposed_value_text: action,
+                rationale: d.note.to_string(),
+                rule_refs: rule_refs_vec(d),
+                blocked_cap: None,
+            }
+        }
+        (DeltaKind::FanThresholds, _) => {
+            // Unconditional thermal row. Build the four clamped thresholds
+            // from CAPS so they audit against the named constants.
+            let s1_off = clamp_fan_on_c(88);
+            let s1_on  = clamp_fan_on_c(93);
+            let s2_off = clamp_fan_on_c(95);
+            let s2_on  = clamp_fan_on_c(98); // capped at fan_on_max_c
+            let action = format!(
+                "stage-1 on/off = {s1_on} / {s1_off} °C; stage-2 on/off = {s2_on} / {s2_off} °C \
+                 (hysteresis ≥ {} °C, stage gap ≥ {} °C, all clamped to [{}-{}] °C)",
+                CAPS.fan_hysteresis_min_c,
+                CAPS.fan_stage_gap_min_c,
+                CAPS.fan_on_min_c,
+                CAPS.fan_on_max_c,
+            );
+            Recommendation {
+                map_name: d.map_name.to_string(),
+                cell_selector: d.cell_selector.to_string(),
+                status: Status::Apply,
+                proposed_value_text: action,
+                rationale: d.note.to_string(),
+                rule_refs: rule_refs_vec(d),
+                blocked_cap: None,
+            }
+        }
+        (DeltaKind::FanRunOn, value) => {
+            let delta = value.unwrap_or(60.0);
+            // Treat the delta as additive over a 60-s OEM baseline (the
+            // real OEM run-on is firmware-dependent — see open questions).
+            let baseline = 60u16;
+            let proposed_total = baseline.saturating_add(delta.max(0.0).round() as u16);
+            let clamped_total = clamp_fan_run_on_s(proposed_total);
+            let actual_delta = clamped_total.saturating_sub(baseline);
+            let action = format!(
+                "+{actual_delta} s post-key-off run-on (clamped total ≤ {} s)",
+                CAPS.fan_run_on_total_max_s,
+            );
+            Recommendation {
+                map_name: d.map_name.to_string(),
+                cell_selector: d.cell_selector.to_string(),
+                status: Status::Apply,
+                proposed_value_text: action,
+                rationale: d.note.to_string(),
+                rule_refs: rule_refs_vec(d),
+                blocked_cap: None,
+            }
+        }
         _ => Recommendation {
             map_name: d.map_name.to_string(),
             cell_selector: d.cell_selector.to_string(),
@@ -374,11 +446,45 @@ mod tests {
     }
 
     #[test]
-    fn engine_outputs_22_recommendations() {
-        // v4 acceptance: every row in DEFAULT_DELTAS becomes one recommendation row.
+    fn engine_outputs_one_recommendation_per_default_delta_row() {
+        // Acceptance: every row in DEFAULT_DELTAS becomes one recommendation row.
         let recs = recommend(&[]);
         assert_eq!(recs.len(), DEFAULT_DELTAS.len());
-        assert_eq!(recs.len(), 22);
+        assert_eq!(recs.len(), 25);
+    }
+
+    #[test]
+    fn r22_firing_promotes_low_pedal_flatten_to_apply() {
+        let recs = recommend(&[finding("R22", Severity::Warn)]);
+        let lp = recs.iter().find(|r| r.map_name == "Driver_Wish_low_pedal").unwrap();
+        assert_eq!(lp.status, Status::Apply);
+        assert!(lp.proposed_value_text.contains("0.40")
+            || lp.proposed_value_text.contains("0.40 mg"));
+    }
+
+    #[test]
+    fn fan_thresholds_always_apply_with_clamped_values() {
+        // Unconditional row: APPLY without any rule firing.
+        let recs = recommend(&[]);
+        let fan = recs.iter().find(|r| r.map_name == "Fan_thresholds").unwrap();
+        assert_eq!(fan.status, Status::Apply);
+        // The four numeric thresholds must be in [88, 98] inclusive.
+        let s = &fan.proposed_value_text;
+        for needle in ["88", "93", "95", "98"] {
+            assert!(s.contains(needle),
+                "fan-threshold action must mention {needle} in: {s}");
+        }
+    }
+
+    #[test]
+    fn fan_run_on_clamped_under_total_ceiling() {
+        let recs = recommend(&[]);
+        let r = recs.iter().find(|r| r.map_name == "Fan_run_on").unwrap();
+        assert_eq!(r.status, Status::Apply);
+        assert!(r.proposed_value_text.contains("60")
+            || r.proposed_value_text.contains("90"),
+            "fan-run-on action must mention an additive seconds value: {}",
+            r.proposed_value_text);
     }
 
     #[test]

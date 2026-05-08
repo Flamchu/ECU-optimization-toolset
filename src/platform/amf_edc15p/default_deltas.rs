@@ -30,6 +30,20 @@ pub enum DeltaKind {
     /// Widen / disable a DTC plausibility threshold so it cannot trip
     /// after the EGR delete.
     SuppressDtc,
+    /// Flatten a map region to a target maximum dY/dX slope. Used by the
+    /// Driver_Wish low-pedal row: the operator targets the slope, the
+    /// tool does not rewrite cells. `value` carries the target slope
+    /// (mg/stroke per percent of pedal).
+    Flatten,
+    /// Set the four cooling-fan stage thresholds (stage-1 on/off, stage-2
+    /// on/off). The four numeric values are derived from CAPS at
+    /// recommendation-time and rendered in the action string after each
+    /// is run through `clamp_fan_on_c`.
+    FanThresholds,
+    /// Add a positive delta (in seconds) to the fan run-on duration.
+    /// `value` carries the delta; the result is capped via
+    /// `clamp_fan_run_on_s` against the absolute total ceiling.
+    FanRunOn,
 }
 
 /// One row in the default sane-deltas table.
@@ -237,6 +251,41 @@ pub const DEFAULT_DELTAS: &[DefaultDelta] = &[
         rule_refs: &[],
         note: "Modelled, no measured EGT to recalibrate against.",
     },
+    // ---- Driveability + thermal additions -------------------------------
+    DefaultDelta {
+        map_name: "Driver_Wish_low_pedal",
+        cell_selector: "pedal 1-25 % (idle creep ≤ 5 % preserved)",
+        kind: DeltaKind::Flatten,
+        value: Some(0.40),
+        rule_refs: &["R22"],
+        note: "Conditional: flatten the off-idle slope so dIQ/dpedal ≤ 0.40 mg \
+               per percent across the 5..25 % band. Idle-creep cells (≤ 5 %) and \
+               mid-pedal cells (>25 %) are NOT touched — the high-pedal \
+               Driver_Wish row stays exactly as is. Apply to all parallel banks.",
+    },
+    DefaultDelta {
+        map_name: "Fan_thresholds",
+        cell_selector: "stage-1 on/off, stage-2 on/off",
+        kind: DeltaKind::FanThresholds,
+        value: None,
+        rule_refs: &[],
+        note: "Lower stage-1 fan-on by ~2-5 °C and stage-2 by ~2 °C versus stock \
+               (95-100 / ~102 °C convention). Hysteresis preserved at ≥ 5 °C; \
+               stages stay at least 4 °C apart; never below the thermostat. \
+               Longevity-positive after EGR delete (cast-iron manifold soaks heat \
+               with no recirc cooling). All values capped via clamp_fan_on_c.",
+    },
+    DefaultDelta {
+        map_name: "Fan_run_on",
+        cell_selector: "scalar (or LUT indexed by T_coolant at key-off)",
+        kind: DeltaKind::FanRunOn,
+        value: Some(60.0),
+        rule_refs: &[],
+        note: "+60 s post-key-off run-on, capped at the absolute battery-protective \
+               ceiling via clamp_fan_run_on_s. Heat-soak after a sustained pull \
+               raises under-bonnet temps for ~2 min; extending run-on keeps the \
+               intercooler core and exhaust manifold cooling.",
+    },
 ];
 
 /// Static guarantee: the lambda value referenced by the smoke-IQ rows is
@@ -259,36 +308,32 @@ mod tests {
     }
 
     #[test]
-    fn v4_has_22_default_deltas() {
-        // v4: 12 baseline + 5 EGR-delete + 5 misc-leave-stock/conditional = 22 rows.
-        assert_eq!(DEFAULT_DELTAS.len(), 22);
+    fn registry_has_25_default_deltas() {
+        // 22 platform/EGR rows + 3 driveability/thermal rows.
+        assert_eq!(DEFAULT_DELTAS.len(), 25);
     }
 
     #[test]
-    fn v4_has_both_egr_bank_rows() {
+    fn both_egr_bank_rows_present() {
         let names: Vec<&str> = DEFAULT_DELTAS.iter().map(|d| d.map_name).collect();
         assert!(names.contains(&"AGR_arwMEAB0KL"));
         assert!(names.contains(&"AGR_arwMEAB1KL"));
     }
 
     #[test]
-    fn idle_fuel_refs_r21_not_r12() {
-        // v4 fix B: Idle_fuel default-delta gates on the new R21 idle-stability rule,
-        // not the misnumbered R12 atm-pressure rule.
+    fn idle_fuel_refs_idle_stability_rule() {
         let idle = DEFAULT_DELTAS.iter().find(|d| d.map_name == "Idle_fuel").unwrap();
         assert_eq!(idle.rule_refs, &["R21"]);
     }
 
     #[test]
     fn duration_axis_extends_to_envelope_iq_cap() {
-        // v4 fix C: Duration row matches the envelope IQ cap.
         let dur = DEFAULT_DELTAS.iter().find(|d| d.map_name == "Duration").unwrap();
         assert_eq!(dur.value, Some(CAPS.peak_iq_mg));
     }
 
     #[test]
     fn smoke_rows_reference_lambda_floor_text_consistently() {
-        // v4 fix A: smoke rows speak λ ≥ 1.05, not 1.20.
         for row in DEFAULT_DELTAS {
             if row.map_name.starts_with("Smoke_IQ") {
                 assert!(row.note.contains("1.05"),
@@ -297,5 +342,49 @@ mod tests {
                     "smoke row {} must NOT reference λ ≥ 1.20", row.map_name);
             }
         }
+    }
+
+    #[test]
+    fn driveability_and_thermal_rows_present() {
+        let names: Vec<&str> = DEFAULT_DELTAS.iter().map(|d| d.map_name).collect();
+        assert!(names.contains(&"Driver_Wish_low_pedal"));
+        assert!(names.contains(&"Fan_thresholds"));
+        assert!(names.contains(&"Fan_run_on"));
+    }
+
+    #[test]
+    fn high_pedal_driver_wish_row_is_byte_identical() {
+        // Snapshot pin: the existing 100 % × 1800-3500 row that sets WOT IQ
+        // to 50 mg/stroke MUST stay exactly as it was. The new low-pedal row
+        // touches a disjoint band and must NOT cross-contaminate the WOT cell.
+        let dw = DEFAULT_DELTAS.iter()
+            .find(|d| d.map_name == "Driver_Wish")
+            .expect("Driver_Wish (high-pedal) row must exist");
+        assert_eq!(dw.cell_selector, "pedal 100% × rpm 1800-3500");
+        assert_eq!(dw.kind, DeltaKind::SetTo);
+        assert_eq!(dw.value, Some(50.0));
+        assert_eq!(dw.rule_refs, &["R07"]);
+    }
+
+    #[test]
+    fn low_pedal_row_targets_correct_band() {
+        let lp = DEFAULT_DELTAS.iter()
+            .find(|d| d.map_name == "Driver_Wish_low_pedal")
+            .expect("Driver_Wish_low_pedal row must exist");
+        assert_eq!(lp.kind, DeltaKind::Flatten);
+        assert_eq!(lp.value, Some(CAPS.low_pedal_slope_max_mg_per_pct));
+        assert_eq!(lp.rule_refs, &["R22"]);
+        // Must operate on the 1..25 % band, never on the WOT band.
+        assert!(lp.cell_selector.contains("1-25"),
+            "low-pedal row must restrict to 1..25 % band, got: {}", lp.cell_selector);
+    }
+
+    #[test]
+    fn fan_rows_have_no_rule_gate() {
+        // Fan deltas are unconditional (longevity-positive, no power impact).
+        let fan_t = DEFAULT_DELTAS.iter().find(|d| d.map_name == "Fan_thresholds").unwrap();
+        let fan_r = DEFAULT_DELTAS.iter().find(|d| d.map_name == "Fan_run_on").unwrap();
+        assert!(fan_t.rule_refs.is_empty(), "Fan_thresholds is unconditional");
+        assert!(fan_r.rule_refs.is_empty(), "Fan_run_on is unconditional");
     }
 }

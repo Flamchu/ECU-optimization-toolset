@@ -83,10 +83,55 @@ pub struct EnvelopeCaps {
     /// Pedal threshold (%) for WOT pull detection. VCDS pedal channel
     /// rounds to 1 % steps; 95 % robustly excludes "near-WOT" coast-up.
     pub pedal_wot_pct: f64,
+
+    // -- Cooling-fan envelope ---------------------------------------------
+    /// Lower bound on stage-1 fan-on threshold (°C). Must stay strictly
+    /// above the ~87 °C thermostat-open temperature so the fan does not
+    /// run permanently at thermostat regulation.
+    pub fan_on_min_c: u8,
+    /// Upper bound on stage-1 fan-on threshold (°C). Stock low-speed
+    /// engagement on most VAG triangle/rounded thermoswitches sits in
+    /// the 95–100 °C band; 98 °C is chosen so the default-delta cannot
+    /// accidentally raise the threshold above stock.
+    pub fan_on_max_c: u8,
+    /// Minimum hysteresis between fan-ON and fan-OFF for the same stage,
+    /// in °C. ECU oscillation guard. 3 °C is the floor of typical OEM
+    /// hysteresis; the default-delta target is ≥ 5 °C.
+    pub fan_hysteresis_min_c: u8,
+    /// Minimum gap between stage-1 fan-on and stage-2 fan-on, in °C.
+    /// Prevents stages collapsing onto the same trigger.
+    pub fan_stage_gap_min_c: u8,
+    /// Maximum *extra* fan run-on time after key-off, in seconds.
+    /// Battery-protection cap on top of OEM run-on.
+    pub fan_run_on_extra_max_s: u16,
+    /// Hard ceiling on absolute fan run-on time (seconds). Typical OEM
+    /// is 60–180 s; cap of 240 s = OEM-max + extra-max.
+    pub fan_run_on_total_max_s: u16,
+
+    // -- Driveability (low-pedal slope) envelope --------------------------
+    /// Maximum permitted dIQ/dpedal slope in the low-pedal band
+    /// (mg/stroke per percent of pedal). Above this, the stock pedal
+    /// map is judged "lurchy" and R22 fires Warn.
+    pub low_pedal_slope_max_mg_per_pct: f64,
+    /// Ratio of low-band slope to mid-band slope above which R22
+    /// escalates to Warn even if the absolute slope is below the cap.
+    pub low_pedal_slope_ratio_max: f64,
+    /// Lower pedal bound (exclusive, %) — pedal_pct ≤ this is "idle
+    /// creep" and is excluded from the slope computation to preserve
+    /// idle behaviour.
+    pub low_pedal_idle_creep_pct: u8,
+    /// Upper pedal bound (inclusive, %) for the "low pedal" band.
+    pub low_pedal_band_top_pct: u8,
+
+    // -- Sustained-pull coolant trend (R23) -------------------------------
+    /// Minimum ΔT_coolant during a single logged pull above which R23
+    /// arms (warm-up rejection). °C.
+    pub r23_coolant_rise_arm_c: u8,
+    /// Peak T_coolant during a pull above which R23 fires Warn. °C.
+    pub r23_coolant_peak_warn_c: u8,
 }
 
-/// Canonical, frozen instance of [`EnvelopeCaps`] (v4 audit-reconciled
-/// edition).
+/// Canonical, frozen instance of [`EnvelopeCaps`].
 pub const CAPS: EnvelopeCaps = EnvelopeCaps {
     peak_boost_mbar_abs: 2150,
     peak_boost_above_4000rpm_mbar_abs: 2050,
@@ -104,6 +149,21 @@ pub const CAPS: EnvelopeCaps = EnvelopeCaps {
     coolant_pull_min_c: 80.0,
     warm_coolant_min_c: 70.0,
     pedal_wot_pct: 95.0,
+    // Cooling-fan envelope.
+    fan_on_min_c: 88,
+    fan_on_max_c: 98,
+    fan_hysteresis_min_c: 3,
+    fan_stage_gap_min_c: 4,
+    fan_run_on_extra_max_s: 90,
+    fan_run_on_total_max_s: 240,
+    // Low-pedal slope envelope.
+    low_pedal_slope_max_mg_per_pct: 0.40,
+    low_pedal_slope_ratio_max: 1.8,
+    low_pedal_idle_creep_pct: 5,
+    low_pedal_band_top_pct: 25,
+    // Sustained-pull coolant trend (R23).
+    r23_coolant_rise_arm_c: 10,
+    r23_coolant_peak_warn_c: 102,
 };
 
 /// Result of running a single proposed value through the envelope.
@@ -242,14 +302,14 @@ pub fn clamp_svbl(proposed_change_mbar: f64) -> ClampOutcome {
     ClampOutcome::ok(0.0)
 }
 
-/// Refuse any non-zero EGR duty in a recommended map. The v3/v4 software
-/// EGR delete is mandatory; mechanical hardware stays installed.
+/// Refuse any non-zero EGR duty in a recommended map. The software EGR
+/// delete is mandatory; mechanical hardware stays installed.
 pub fn clamp_egr_duty_pct(proposed_duty_pct: f64) -> ClampOutcome {
     if proposed_duty_pct.abs() > f64::EPSILON {
         return ClampOutcome::blocked(
             CAPS.egr_duty_max_pct,
             "egr_duty_max_pct",
-            "v4 mandates software EGR delete: EGR duty must be 0 % in every \
+            "Software EGR delete is mandatory: EGR duty must be 0 % in every \
              recommended map cell. Mechanical EGR hardware stays installed; \
              only the duty map and spec-MAF map are flashed."
                 .to_string(),
@@ -293,6 +353,32 @@ pub fn clamp_eoi_atdc(proposed_eoi_atdc: f64) -> ClampOutcome {
     ClampOutcome::ok(proposed_eoi_atdc)
 }
 
+/// Cap a fan-on/-off threshold (°C) into the legal stage-1/stage-2 band.
+/// Operates in u8 °C; never returns a value below `fan_on_min_c` (would
+/// run the fan permanently against the thermostat) or above `fan_on_max_c`
+/// (above stock).
+#[must_use]
+pub fn clamp_fan_on_c(t: u8) -> u8 {
+    t.clamp(CAPS.fan_on_min_c, CAPS.fan_on_max_c)
+}
+
+/// Cap fan run-on duration (seconds) at the absolute total ceiling. The
+/// cap protects the OEM 12 V / 61 Ah battery against an excessively long
+/// post-key-off run-on.
+#[must_use]
+pub fn clamp_fan_run_on_s(s: u16) -> u16 {
+    s.min(CAPS.fan_run_on_total_max_s)
+}
+
+/// Cap a measured low-pedal IQ slope (mg/stroke per percent of pedal).
+/// NaN / non-finite inputs become 0.0; the upper bound is 4× the warn
+/// threshold (a physical guard rather than a control limit).
+#[must_use]
+pub fn clamp_low_pedal_slope(s: f64) -> f64 {
+    if !s.is_finite() { return 0.0; }
+    s.clamp(0.0, CAPS.low_pedal_slope_max_mg_per_pct * 4.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn iq_v2_old_cap_now_passes() {
+    fn iq_just_below_cap_passes() {
         let r = clamp_iq(52.0);
         assert!(!r.blocked);
     }
@@ -376,14 +462,13 @@ mod tests {
     }
 
     #[test]
-    fn lambda_at_v4_floor_passes() {
+    fn lambda_at_canonical_floor_passes() {
         let r = clamp_lambda_floor(1.05);
         assert!(!r.blocked);
     }
 
     #[test]
-    fn lambda_at_v2_old_floor_now_passes() {
-        // v2's 1.20 used to be the floor; v3+v4 keep 1.05.
+    fn lambda_well_above_floor_passes() {
         let r = clamp_lambda_floor(1.10);
         assert!(!r.blocked);
     }
@@ -431,17 +516,56 @@ mod tests {
     }
 
     #[test]
-    fn caps_lambda_floor_is_v4_canonical() {
-        // v4 acceptance #4: λ floor unified at 1.05 across the codebase.
+    fn caps_lambda_floor_is_canonical() {
+        // λ floor is unified at 1.05 across the codebase.
         assert!((CAPS.lambda_floor - 1.05).abs() < f64::EPSILON);
     }
 
     #[test]
     fn caps_coolant_constants_disambiguated() {
-        // v4 fix F + Y: pull-coolant minimum (80) and warm-cruise (70) split.
+        // Pull-coolant minimum (80) and warm-cruise/idle (70) are distinct caps.
         assert!((CAPS.coolant_pull_min_c - 80.0).abs() < f64::EPSILON);
         assert!((CAPS.warm_coolant_min_c - 70.0).abs() < f64::EPSILON);
         // The relative ordering is also a compile-time invariant — see
         // `_SELF_CONSISTENT` in tests/integration_envelope.rs.
     }
+
+    #[test]
+    fn fan_on_clamp_clamps_to_legal_band() {
+        assert_eq!(clamp_fan_on_c(50), CAPS.fan_on_min_c);
+        assert_eq!(clamp_fan_on_c(120), CAPS.fan_on_max_c);
+        assert_eq!(clamp_fan_on_c(93), 93);
+        assert_eq!(clamp_fan_on_c(98), CAPS.fan_on_max_c);
+        assert_eq!(clamp_fan_on_c(88), CAPS.fan_on_min_c);
+    }
+
+    #[test]
+    fn fan_run_on_clamp_caps_total() {
+        assert_eq!(clamp_fan_run_on_s(60), 60);
+        assert_eq!(clamp_fan_run_on_s(240), CAPS.fan_run_on_total_max_s);
+        assert_eq!(clamp_fan_run_on_s(500), CAPS.fan_run_on_total_max_s);
+    }
+
+    #[test]
+    fn low_pedal_slope_clamp_handles_nan_and_neg() {
+        assert_eq!(clamp_low_pedal_slope(f64::NAN), 0.0);
+        assert_eq!(clamp_low_pedal_slope(f64::INFINITY), 0.0);
+        assert_eq!(clamp_low_pedal_slope(-1.0), 0.0);
+        let big = clamp_low_pedal_slope(99.0);
+        assert!((big - CAPS.low_pedal_slope_max_mg_per_pct * 4.0).abs() < 1e-12);
+        assert!((clamp_low_pedal_slope(0.30) - 0.30).abs() < 1e-12);
+    }
+
+    // Fan and low-pedal constant invariants are compile-time const asserts,
+    // not runtime tests, because every comparison is between two const u8 /
+    // f64 values and clippy::assertions_on_constants would flag a runtime
+    // assert!.
+    const _FAN_AND_LOW_PEDAL_CAPS_INVARIANTS: () = {
+        assert!(CAPS.fan_on_min_c < CAPS.fan_on_max_c);
+        assert!(CAPS.fan_run_on_total_max_s >= CAPS.fan_run_on_extra_max_s);
+        assert!(CAPS.low_pedal_idle_creep_pct < CAPS.low_pedal_band_top_pct);
+        assert!(CAPS.r23_coolant_rise_arm_c >= 5);
+        assert!(CAPS.r23_coolant_peak_warn_c >= 95);
+        assert!(CAPS.r23_coolant_peak_warn_c as f64 >= CAPS.coolant_pull_min_c);
+    };
 }

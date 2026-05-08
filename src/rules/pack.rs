@@ -11,7 +11,9 @@ use crate::platform::amf_edc15p::egr::{
     IDLE_PEDAL_MAX_PCT, IDLE_WINDOW_MIN_S, MAF_DEVIATION_FRACTION,
     MAF_DEVIATION_MIN_DURATION_S, MAF_EXCESS_INFO_MG, WOT_PEDAL_CUTOFF_PCT,
 };
-use crate::platform::amf_edc15p::envelope::{CAPS, DIESEL_AFR_STOICH, NM_PER_MG_IQ};
+use crate::platform::amf_edc15p::envelope::{
+    clamp_low_pedal_slope, CAPS, DIESEL_AFR_STOICH, NM_PER_MG_IQ,
+};
 use crate::platform::amf_edc15p::stock_refs::stock_boost_at_rpm;
 use crate::rules::base::{make_skipped, Finding, Rule, RuleScope, Severity};
 use crate::util::timebase::ResampledLog;
@@ -21,8 +23,8 @@ use crate::util::Pull;
 // Rule id enumeration (exhaustive — every variant must be dispatched).
 // ---------------------------------------------------------------------------
 
-/// All 21 rule ids in canonical order. Used for exhaustive dispatch and
-/// the v4 acceptance test that asserts every variant is reachable.
+/// All rule ids in canonical order. Used for exhaustive dispatch and the
+/// acceptance test that asserts every variant is reachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RuleId {
     /// R01 — Underboost.
@@ -63,10 +65,14 @@ pub enum RuleId {
     R18,
     /// R19 — DTC scan.
     R19,
-    /// R20 — Cruise spec-MAF excess (was R17b).
+    /// R20 — Cruise spec-MAF excess.
     R20,
     /// R21 — Idle stability.
     R21,
+    /// R22 — Low-pedal IQ slope excessive (driveability).
+    R22,
+    /// R23 — Sustained-pull coolant trend (thermal).
+    R23,
 }
 
 /// Iteration order for the rule pack.
@@ -75,12 +81,11 @@ pub const ALL_RULE_IDS: &[RuleId] = &[
     RuleId::R06, RuleId::R07, RuleId::R08, RuleId::R09, RuleId::R10,
     RuleId::R11, RuleId::R12, RuleId::R13, RuleId::R14, RuleId::R15,
     RuleId::R16, RuleId::R17, RuleId::R18, RuleId::R19, RuleId::R20,
-    RuleId::R21,
+    RuleId::R21, RuleId::R22, RuleId::R23,
 ];
 
 impl RuleId {
-    /// Short string id used everywhere outside the dispatcher (`"R01"`,
-    /// ... `"R21"`).
+    /// Short string id used everywhere outside the dispatcher.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::R01 => "R01", Self::R02 => "R02", Self::R03 => "R03",
@@ -90,6 +95,7 @@ impl RuleId {
             Self::R13 => "R13", Self::R14 => "R14", Self::R15 => "R15",
             Self::R16 => "R16", Self::R17 => "R17", Self::R18 => "R18",
             Self::R19 => "R19", Self::R20 => "R20", Self::R21 => "R21",
+            Self::R22 => "R22", Self::R23 => "R23",
         }
     }
 
@@ -103,6 +109,7 @@ impl RuleId {
             Self::R13 => &R13, Self::R14 => &R14, Self::R15 => &R15,
             Self::R16 => &R16, Self::R17 => &R17, Self::R18 => &R18,
             Self::R19 => &R19, Self::R20 => &R20, Self::R21 => &R21,
+            Self::R22 => &R22, Self::R23 => &R23,
         }
     }
 }
@@ -361,8 +368,8 @@ pub const R20: Rule = Rule {
     requires_groups: &["003"],
 };
 
-/// R21 — Idle stability (NEW in v4). Global scope; evaluates the warm
-/// idle window across the whole log.
+/// R21 — Idle stability. Global scope; evaluates the warm idle window
+/// across the whole log.
 pub const R21: Rule = Rule {
     id: "R21",
     severity: Severity::Warn,
@@ -375,11 +382,42 @@ pub const R21: Rule = Rule {
     requires_groups: &["001"],
 };
 
-/// All rules in canonical order (v4: R01..R21).
+/// R22 — Low-pedal IQ slope (driveability). Per-pull, Warn baseline
+/// (no LOW_RATE downgrade — mirrors R10).
+pub const R22: Rule = Rule {
+    id: "R22",
+    severity: Severity::Warn,
+    scope: RuleScope::PerPull,
+    rationale_one_liner:
+        "Low-pedal Driver_Wish slope ramps IQ too aggressively (off-idle lunge). \
+         Linear regression of iq_mg against pedal_pct in the 5..25 % band; fires \
+         Warn if the slope exceeds the cap, or if it is markedly steeper than the \
+         25..80 % mid-band.",
+    recommended_delta_ref: Some("Driver_Wish_low_pedal"),
+    requires_channels: &["pedal_pct", "iq_requested", "rpm"],
+    requires_groups: &["008"],
+};
+
+/// R23 — Sustained-pull coolant trend (thermal). Per-pull. Pass / Info /
+/// Warn ladder; never Critical.
+pub const R23: Rule = Rule {
+    id: "R23",
+    severity: Severity::Info,
+    scope: RuleScope::PerPull,
+    rationale_one_liner:
+        "Coolant rose substantially during a sustained pull and approached or \
+         exceeded the warn-level peak. Verifies that the cooling-fan threshold \
+         and run-on tune is doing useful work.",
+    recommended_delta_ref: Some("Fan_thresholds"),
+    requires_channels: &["coolant_c", "rpm"],
+    requires_groups: &["001", "011"],
+};
+
+/// All rules in canonical order (R01..R23).
 pub const ALL_RULES: &[&Rule] = &[
     &R01, &R02, &R03, &R04, &R05, &R06, &R07,
     &R08, &R09, &R10, &R11, &R12, &R13, &R14, &R15,
-    &R16, &R17, &R18, &R19, &R20, &R21,
+    &R16, &R17, &R18, &R19, &R20, &R21, &R22, &R23,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1003,6 +1041,187 @@ pub fn r20_maf_excess_info(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
     )]
 }
 
+/// Linear regression slope of `y` on `x`. Returns `None` if fewer than
+/// two distinct samples or if denominator is zero. Pure helper.
+fn linreg_slope(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    debug_assert_eq!(xs.len(), ys.len());
+    let n = xs.len();
+    if n < 2 { return None; }
+    let inv_n = 1.0 / n as f64;
+    let mean_x = xs.iter().sum::<f64>() * inv_n;
+    let mean_y = ys.iter().sum::<f64>() * inv_n;
+    let mut num = 0.0;
+    let mut den = 0.0;
+    for i in 0..n {
+        let dx = xs[i] - mean_x;
+        num += dx * (ys[i] - mean_y);
+        den += dx * dx;
+    }
+    if den.abs() < f64::EPSILON {
+        return None;
+    }
+    Some(num / den)
+}
+
+/// R22 — Low-pedal IQ slope rule.
+///
+/// Filters samples to the warm, off-idle, on-engine band, computes a
+/// linear regression of `iq_requested` against `pedal_pct` in the
+/// low-pedal sub-band, and compares both the absolute slope and the
+/// low/mid ratio against the envelope caps.
+pub fn r22_low_pedal_slope(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
+    if !log.has("pedal_pct") {
+        return vec![make_skipped(
+            &R22, pull,
+            "pedal_pct channel unavailable; R22 requires a pedal sweep",
+        )];
+    }
+    if !has_all(log, &["iq_requested", "rpm"]) {
+        return vec![make_skipped(&R22, pull, "channels iq_requested/rpm missing")];
+    }
+    let pedal = match slice(log, pull, "pedal_pct") { Some(v) => v, None => return vec![] };
+    let iq = match slice(log, pull, "iq_requested") { Some(v) => v, None => return vec![] };
+    let rpm = match slice(log, pull, "rpm") { Some(v) => v, None => return vec![] };
+    let coolant = slice(log, pull, "coolant_c");
+
+    let creep = f64::from(CAPS.low_pedal_idle_creep_pct);
+    let band_top = f64::from(CAPS.low_pedal_band_top_pct);
+    let mid_top = 80.0;
+    let warm = CAPS.warm_coolant_min_c;
+
+    let mut low_x: Vec<f64> = Vec::new();
+    let mut low_y: Vec<f64> = Vec::new();
+    let mut mid_x: Vec<f64> = Vec::new();
+    let mut mid_y: Vec<f64> = Vec::new();
+
+    for i in 0..pedal.len() {
+        if !pedal[i].is_finite() || !iq[i].is_finite() || !rpm[i].is_finite() {
+            continue;
+        }
+        if rpm[i] < 1000.0 { continue; }
+        if let Some(c) = coolant {
+            if c[i].is_finite() && c[i] < warm { continue; }
+        }
+        let p = pedal[i];
+        if p > creep && p <= band_top {
+            low_x.push(p);
+            low_y.push(iq[i]);
+        } else if p > band_top && p <= mid_top {
+            mid_x.push(p);
+            mid_y.push(iq[i]);
+        }
+    }
+
+    if low_x.len() < 30 {
+        return vec![make_skipped(
+            &R22, pull,
+            "fewer than 30 samples in low-pedal band (5..25 %); pedal sweep too sparse",
+        )];
+    }
+
+    let slope_low_raw = match linreg_slope(&low_x, &low_y) {
+        Some(s) if s.is_finite() => s,
+        _ => return vec![make_skipped(&R22, pull, "low-band regression denominator zero")],
+    };
+    let slope_low = clamp_low_pedal_slope(slope_low_raw);
+    let slope_mid = linreg_slope(&mid_x, &mid_y).filter(|s| s.is_finite()).unwrap_or(0.0);
+
+    let abs_breach = slope_low > CAPS.low_pedal_slope_max_mg_per_pct;
+    let ratio_breach = slope_mid > 0.0
+        && slope_low / slope_mid > CAPS.low_pedal_slope_ratio_max;
+
+    if !abs_breach && !ratio_breach {
+        return vec![];
+    }
+
+    let trigger = if abs_breach { "absolute" } else { "ratio" };
+    let rationale = format!(
+        "{} slope_low={:.3} mg/pct, slope_mid={:.3} mg/pct over {} low-band / {} mid-band samples \
+         ({trigger} test)",
+        R22.rationale_one_liner,
+        slope_low, slope_mid, low_x.len(), mid_x.len(),
+    );
+    vec![one(
+        &R22, pull, Severity::Warn,
+        slope_low, CAPS.low_pedal_slope_max_mg_per_pct,
+        &rationale,
+        Some("Driver_Wish_low_pedal: flatten 5..25 % pedal column band; preserve idle creep ≤ 5 %."),
+    )]
+}
+
+/// R23 — Sustained-pull coolant trend rule.
+pub fn r23_coolant_trend(log: &ResampledLog, pull: &Pull) -> Vec<Finding> {
+    if !log.has("coolant_c") {
+        return vec![make_skipped(&R23, pull, "channel coolant_c missing")];
+    }
+    if !log.has("rpm") {
+        return vec![make_skipped(&R23, pull, "channel rpm missing")];
+    }
+    let coolant = match slice(log, pull, "coolant_c") { Some(v) => v, None => return vec![] };
+    let rpm = match slice(log, pull, "rpm") { Some(v) => v, None => return vec![] };
+    let pedal = slice(log, pull, "pedal_pct");
+
+    if pull.duration_s() < 5.0 {
+        return vec![make_skipped(&R23, pull, "pull duration < 5 s")];
+    }
+    let max_rpm = finite_max(rpm).unwrap_or(0.0);
+    if max_rpm < 2500.0 {
+        return vec![make_skipped(&R23, pull, "rpm never exceeds 2500 in pull window")];
+    }
+
+    let n = coolant.len();
+    let mut included: Vec<f64> = Vec::with_capacity(n);
+    for i in 0..n {
+        if !coolant[i].is_finite() || !rpm[i].is_finite() { continue; }
+        if rpm[i] < 2500.0 { continue; }
+        if let Some(p) = pedal {
+            if p[i].is_finite() && p[i] < 60.0 { continue; }
+        }
+        included.push(coolant[i]);
+    }
+    // If the pedal-gated set is too sparse, fall back to the rpm-gated set.
+    let series: Vec<f64> = if included.len() >= 5 {
+        included
+    } else {
+        coolant.iter().copied()
+            .zip(rpm.iter().copied())
+            .filter(|(c, r)| c.is_finite() && r.is_finite() && *r >= 2500.0)
+            .map(|(c, _)| c)
+            .collect()
+    };
+    if series.len() < 2 {
+        return vec![make_skipped(&R23, pull, "fewer than 2 finite coolant samples in pull window")];
+    }
+    let t_min = finite_min(&series).unwrap_or(0.0);
+    let t_peak = finite_max(&series).unwrap_or(0.0);
+    let dt = t_peak - t_min;
+
+    let arm_c = f64::from(CAPS.r23_coolant_rise_arm_c);
+    let warn_c = f64::from(CAPS.r23_coolant_peak_warn_c);
+
+    if dt < arm_c {
+        // Rule armed but quiet — emit a low-noise Info pass token only
+        // when we have meaningful evidence.
+        return vec![];
+    }
+    let severity = if t_peak >= warn_c { Severity::Warn } else { Severity::Info };
+    let rationale = format!(
+        "T_coolant rose by {:.1} °C and peaked at {:.1} °C during a sustained pull \
+         (>{:.0} °C arms; ≥{:.0} °C warns). Verify Fan_thresholds + Fan_run_on are in effect.",
+        dt, t_peak, arm_c, warn_c,
+    );
+    let action = if matches!(severity, Severity::Warn) {
+        "Fan_thresholds: lower stage-1 on/off; Fan_run_on: extend post-key-off run-on."
+    } else {
+        "Fan_thresholds / Fan_run_on apply unconditionally; verify the flash actually wrote them."
+    };
+    vec![one(
+        &R23, pull, severity,
+        t_peak, warn_c, &rationale,
+        Some(action),
+    )]
+}
+
 /// R21 — Idle stability. Global scope; evaluates every warm-idle window
 /// (coolant ≥ warm threshold, pedal ≤ idle, vehicle_speed = 0 if known).
 /// Severity Warn at σ > 25; downgrades to Info if window < 30 s OR
@@ -1103,6 +1322,7 @@ pub fn dispatch(
         "R13" => RuleId::R13, "R14" => RuleId::R14, "R15" => RuleId::R15,
         "R16" => RuleId::R16, "R17" => RuleId::R17, "R18" => RuleId::R18,
         "R19" => RuleId::R19, "R20" => RuleId::R20, "R21" => RuleId::R21,
+        "R22" => RuleId::R22, "R23" => RuleId::R23,
         _ => return Vec::new(),
     };
     match id {
@@ -1127,5 +1347,7 @@ pub fn dispatch(
         RuleId::R19 => r19_dtc_scan(dtcs, pull),
         RuleId::R20 => r20_maf_excess_info(log, pull),
         RuleId::R21 => r21_idle_stability(log, pull),
+        RuleId::R22 => r22_low_pedal_slope(log, pull),
+        RuleId::R23 => r23_coolant_trend(log, pull),
     }
 }
