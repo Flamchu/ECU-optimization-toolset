@@ -1,4 +1,4 @@
-//! Recommendation engine.
+//! Recommendation engine (v4).
 //!
 //! Joins findings with the default-deltas table and runs every emitted
 //! delta through the envelope clamper before emitting it.
@@ -154,7 +154,10 @@ fn eval_default(d: &DefaultDelta, firing: &BTreeSet<String>) -> Recommendation {
         (DeltaKind::DeltaDeg, Some(value)) => {
             let original = pretty_signed(value, "° BTDC");
             let absolute_soi = 21.0 + value;
-            let outcome = clamp_soi(absolute_soi, 45.0);
+            // Use the SOI threshold IQ so the cap actually engages for SOI rows
+            // that target high-IQ regions; cruise NVH retard rows pass through.
+            let probe_iq = if d.map_name == "SOI_warm_cruise" { 10.0 } else { 45.0 };
+            let outcome = clamp_soi(absolute_soi, probe_iq);
             let (text, status, cap, extra) = formatted(&outcome, &original);
             Recommendation {
                 map_name: d.map_name.to_string(),
@@ -192,8 +195,8 @@ fn eval_default(d: &DefaultDelta, firing: &BTreeSet<String>) -> Recommendation {
                     };
                 }
             }
-            // Smoke limiter rows: the clamp is conceptual (enforce λ ≥ 1.20)
-            // rather than a single number.
+            // Smoke limiter rows: the clamp is conceptual (enforce λ ≥ 1.05)
+            // rather than a single number. Cross-link with CAPS.
             Recommendation {
                 map_name: d.map_name.to_string(),
                 cell_selector: d.cell_selector.to_string(),
@@ -216,7 +219,7 @@ fn eval_default(d: &DefaultDelta, firing: &BTreeSet<String>) -> Recommendation {
             }
         }
         (DeltaKind::ZeroEgr, _) => {
-            // Mandatory v3: always emit APPLY. Run the proposed 0 % through
+            // Mandatory v4: always emit APPLY. Run the proposed 0 % through
             // clamp_egr_duty_pct so any future caller passing a non-zero
             // value would still be blocked.
             let outcome = clamp_egr_duty_pct(0.0);
@@ -244,7 +247,7 @@ fn eval_default(d: &DefaultDelta, firing: &BTreeSet<String>) -> Recommendation {
             }
         }
         (DeltaKind::SuppressDtc, _) => {
-            // Symbolic only — no numeric clamp. Always APPLY in v3.
+            // Symbolic only — no numeric clamp. Always APPLY.
             Recommendation {
                 map_name: d.map_name.to_string(),
                 cell_selector: d.cell_selector.to_string(),
@@ -312,17 +315,17 @@ mod tests {
     #[test]
     fn no_findings_skips_conditional_rows_but_applies_egr_mandate() {
         let recs = recommend(&[]);
-        // Rows with rule_refs need a triggering rule → all SKIP without findings.
         for r in &recs {
             if !r.rule_refs.is_empty() {
                 assert!(matches!(r.status, Status::Skip),
                     "{} should SKIP without firing rule", r.map_name);
             }
         }
-        // The unconditional v3 EGR-delete mandate ALWAYS applies, regardless
-        // of findings (it is the v3 thesis).
-        let egr = recs.iter().find(|r| r.map_name == "AGR_arwMEAB0KL").unwrap();
-        assert_eq!(egr.status, Status::Apply);
+        // The unconditional v4 EGR-delete mandate ALWAYS applies.
+        let bank_a = recs.iter().find(|r| r.map_name == "AGR_arwMEAB0KL").unwrap();
+        assert_eq!(bank_a.status, Status::Apply);
+        let bank_b = recs.iter().find(|r| r.map_name == "AGR_arwMEAB1KL").unwrap();
+        assert_eq!(bank_b.status, Status::Apply);
         let spec = recs.iter().find(|r| r.map_name == "arwMLGRDKF").unwrap();
         assert_eq!(spec.status, Status::Apply);
         let dtc = recs.iter().find(|r| r.map_name == "DTC_thresholds").unwrap();
@@ -361,5 +364,39 @@ mod tests {
         let svbl = recs.iter().find(|r| r.map_name == "SVBL").unwrap();
         assert_eq!(svbl.status, Status::Skip);
         assert_eq!(svbl.proposed_value_text, "leave stock");
+    }
+
+    #[test]
+    fn r21_firing_promotes_idle_fuel_to_apply() {
+        let recs = recommend(&[finding("R21", Severity::Warn)]);
+        let idle = recs.iter().find(|r| r.map_name == "Idle_fuel").unwrap();
+        assert_eq!(idle.status, Status::Apply);
+    }
+
+    #[test]
+    fn engine_outputs_22_recommendations() {
+        // v4 acceptance: every row in DEFAULT_DELTAS becomes one recommendation row.
+        let recs = recommend(&[]);
+        assert_eq!(recs.len(), DEFAULT_DELTAS.len());
+        assert_eq!(recs.len(), 22);
+    }
+
+    #[test]
+    fn engine_emits_both_egr_banks() {
+        // v4 fix W: the bank-pair contract — one row per bank.
+        let recs = recommend(&[]);
+        let banks: Vec<&str> = recs.iter()
+            .filter(|r| r.map_name.starts_with("AGR_arwMEAB"))
+            .map(|r| r.map_name.as_str()).collect();
+        assert!(banks.contains(&"AGR_arwMEAB0KL"));
+        assert!(banks.contains(&"AGR_arwMEAB1KL"));
+    }
+
+    #[test]
+    fn smoke_rows_render_lambda_floor_from_caps() {
+        // v4 acceptance #4: the rendered λ value is the CAPS const.
+        let recs = recommend(&[finding("R06", Severity::Critical)]);
+        let smoke = recs.iter().find(|r| r.map_name == "Smoke_IQ_by_MAF").unwrap();
+        assert!(smoke.proposed_value_text.contains(&format!("{}", CAPS.lambda_floor)));
     }
 }

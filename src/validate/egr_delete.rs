@@ -1,17 +1,22 @@
-//! v3 EGR-delete post-flash validation checklist (spec §7).
+//! EGR-delete post-flash validation checklist (spec §10, v4).
 //!
 //! 15 yes/no checks against a post-flash log. Each emits a
 //! [`CheckOutcome`] with a status (`Pass` / `Fail` / `Skipped`),
 //! observed evidence, and a remediation pointer. The aggregate
 //! [`ValidationReport`] is `pass()` only when no item failed.
+//!
+//! v4 changes from v3:
+//! - DTCs read from `VcdsLog.dtcs` (sidecar), not a synthetic float channel.
+//! - Check 10 (cruise NVH) is *always* Skipped — subjective driver note required.
+//! - Coolant thresholds split: pull integrity 80 °C; warm cruise/idle 70 °C.
+//! - Spec §10 introduces optional pre-delete cross-check items 11/12.
 
 use crate::ingest::VcdsLog;
 use crate::platform::amf_edc15p::egr::{
-    DTC_LIST_TO_SUPPRESS, DTC_WIRING_FAULTS, EGR_DUTY_OBSERVED_TOLERANCE_PCT,
-    IDLE_INSTABILITY_THRESHOLD_RPM_STD, SPEC_MAF_FILL_MGSTR, WARM_COOLANT_MIN_C,
-    WOT_PEDAL_CUTOFF_PCT,
+    DTC_GROUP_A, EGR_DUTY_OBSERVED_TOLERANCE_PCT, IDLE_INSTABILITY_THRESHOLD_RPM_STD,
+    IDLE_IQ_MAX_MG, IDLE_PEDAL_MAX_PCT, MAF_DEVIATION_FRACTION, WOT_PEDAL_CUTOFF_PCT,
 };
-use crate::platform::amf_edc15p::envelope::{CAPS, DIESEL_AFR_STOICH, NM_PER_MG_IQ};
+use crate::platform::amf_edc15p::envelope::{CAPS, DIESEL_AFR_STOICH};
 
 /// One check's outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +25,7 @@ pub enum CheckStatus {
     Pass,
     /// Check evaluated and failed.
     Fail,
-    /// Check could not be evaluated (channel missing).
+    /// Check could not be evaluated (channel missing) or is manual.
     Skipped,
 }
 
@@ -47,7 +52,7 @@ impl CheckStatus {
 /// One row in the validation checklist.
 #[derive(Debug, Clone)]
 pub struct CheckOutcome {
-    /// Position in the §7 checklist (1-based).
+    /// Position in the §10 checklist (1-based).
     pub id: u8,
     /// Short label.
     pub title: String,
@@ -55,7 +60,7 @@ pub struct CheckOutcome {
     pub status: CheckStatus,
     /// Observed value or summary string.
     pub observed: String,
-    /// Pointer to the remediation action when failed.
+    /// Pointer to the remediation action when failed (or note when skipped).
     pub remediation: String,
 }
 
@@ -97,8 +102,8 @@ impl ValidationReport {
                 it.status.as_str(),
                 it.observed,
             ));
-            if it.status == CheckStatus::Fail {
-                lines.push(format!("    - Remediation: {}", it.remediation));
+            if it.status == CheckStatus::Fail || (it.status == CheckStatus::Skipped && !it.remediation.is_empty()) {
+                lines.push(format!("    - {}", it.remediation));
             }
         }
         lines.push(String::new());
@@ -139,15 +144,6 @@ fn finite_mean_std(xs: &[f64]) -> Option<(f64, f64)> {
     Some((mean, var.sqrt()))
 }
 
-/// Indices of warm samples (coolant ≥ `WARM_COOLANT_MIN_C`).
-fn warm_indices(log: &VcdsLog) -> Vec<usize> {
-    let Some(coolant) = log.data.get("coolant_c") else { return Vec::new(); };
-    coolant.iter().enumerate()
-        .filter(|(_, c)| c.is_finite() && **c >= WARM_COOLANT_MIN_C)
-        .map(|(i, _)| i)
-        .collect()
-}
-
 fn pass(id: u8, title: &str, observed: String) -> CheckOutcome {
     CheckOutcome {
         id, title: title.to_string(), status: CheckStatus::Pass,
@@ -169,366 +165,430 @@ fn skipped(id: u8, title: &str, reason: &str) -> CheckOutcome {
     }
 }
 
+fn skipped_with_note(id: u8, title: &str, observed: &str, note: &str) -> CheckOutcome {
+    CheckOutcome {
+        id, title: title.to_string(), status: CheckStatus::Skipped,
+        observed: observed.to_string(), remediation: note.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Individual checks (numbered per §7)
+// Individual checks (numbered per §10)
 // ---------------------------------------------------------------------------
 
-fn check1_egr_duty_idle(log: &VcdsLog) -> CheckOutcome {
-    let title = "EGR duty zero at warm idle";
-    let Some(duty) = log.data.get("egr_duty") else {
-        return skipped(1, title, "egr_duty channel missing");
+fn check1_idle_maf(log: &VcdsLog) -> CheckOutcome {
+    let title = "Idle MAF (post) ≥ 250 mg/str warm";
+    let Some(maf) = log.data.get("maf_actual") else {
+        return skipped(1, title, "maf_actual channel missing");
     };
     let Some(coolant) = log.data.get("coolant_c") else {
         return skipped(1, title, "coolant_c channel missing");
     };
+    let pedal = log.data.get("pedal_pct");
     let iq = log.data.get("iq_requested").or_else(|| log.data.get("iq_actual"));
-    let mut max_duty = f64::NEG_INFINITY;
-    let mut samples = 0;
-    for i in 0..duty.len() {
-        if !duty[i].is_finite() { continue; }
-        if !coolant[i].is_finite() || coolant[i] < WARM_COOLANT_MIN_C { continue; }
-        if let Some(iqv) = iq {
-            if i < iqv.len() && iqv[i].is_finite() && iqv[i] > 8.0 { continue; }
-        }
-        samples += 1;
-        if duty[i] > max_duty { max_duty = duty[i]; }
+    let mut min_idle: Option<f64> = None;
+    for i in 0..maf.len() {
+        if i >= coolant.len() || !coolant[i].is_finite() || coolant[i] < CAPS.warm_coolant_min_c { continue; }
+        let pedal_ok = match pedal {
+            Some(p) if i < p.len() && p[i].is_finite() => p[i] <= IDLE_PEDAL_MAX_PCT,
+            _ => match iq {
+                Some(q) if i < q.len() && q[i].is_finite() => q[i] <= IDLE_IQ_MAX_MG,
+                _ => true,
+            },
+        };
+        if !pedal_ok || !maf[i].is_finite() { continue; }
+        min_idle = Some(min_idle.map_or(maf[i], |m| m.min(maf[i])));
     }
-    if samples == 0 {
-        return skipped(1, title, "no warm-idle samples in log");
-    }
-    if max_duty <= EGR_DUTY_OBSERVED_TOLERANCE_PCT {
-        pass(1, title, format!("max EGR duty at idle = {max_duty:.1}% ({samples} samples)"))
+    let Some(min) = min_idle else {
+        return skipped(1, title, "no warm-idle MAF samples");
+    };
+    if min >= 250.0 {
+        pass(1, title, format!("min warm-idle MAF = {min:.0} mg/stroke"))
     } else {
-        fail(1, title, format!("max EGR duty at idle = {max_duty:.1}% (>{} tolerance)",
-            EGR_DUTY_OBSERVED_TOLERANCE_PCT),
-            "Re-flash EGR-duty map (arwMEAB0KL) to 0% in both banks.")
+        fail(1, title, format!("min warm-idle MAF = {min:.0} mg/stroke (< 250)"),
+            "Idle MAF dropped below 250 — confirm both EGR banks zeroed and spec-MAF saturated.")
     }
 }
 
-fn check2_egr_duty_cruise(log: &VcdsLog) -> CheckOutcome {
-    let title = "EGR duty zero at cruise";
-    let Some(duty) = log.data.get("egr_duty") else {
-        return skipped(2, title, "egr_duty channel missing");
+fn check2_cruise_maf(log: &VcdsLog) -> CheckOutcome {
+    let title = "Cruise MAF (post) within ±10 % of spec";
+    let Some(actual) = log.data.get("maf_actual") else {
+        return skipped(2, title, "maf_actual channel missing");
+    };
+    let Some(spec) = log.data.get("maf_spec") else {
+        return skipped(2, title, "maf_spec channel missing");
     };
     let Some(rpm) = log.data.get("rpm") else {
         return skipped(2, title, "rpm channel missing");
     };
-    let iq = log.data.get("iq_requested").or_else(|| log.data.get("iq_actual"));
+    let pedal = log.data.get("pedal_pct");
     let coolant = log.data.get("coolant_c");
     let (lo, hi, iq_lo, iq_hi) = (1500.0, 2500.0, 5.0, 15.0);
+    let iq = log.data.get("iq_requested").or_else(|| log.data.get("iq_actual"));
 
-    let mut max_duty = f64::NEG_INFINITY;
+    let mut worst: f64 = 0.0;
     let mut samples = 0;
-    for i in 0..duty.len() {
-        if !duty[i].is_finite() || !rpm[i].is_finite() { continue; }
-        if rpm[i] < lo || rpm[i] > hi { continue; }
-        if let Some(iqv) = iq {
-            if i < iqv.len() && iqv[i].is_finite()
-                && (iqv[i] < iq_lo || iqv[i] > iq_hi)
-            {
-                continue;
-            }
+    for i in 0..actual.len() {
+        if i >= spec.len() || i >= rpm.len() { break; }
+        if !actual[i].is_finite() || !spec[i].is_finite() || !rpm[i].is_finite() { continue; }
+        if !(lo..=hi).contains(&rpm[i]) { continue; }
+        if let Some(q) = iq {
+            if i < q.len() && q[i].is_finite() && (q[i] < iq_lo || q[i] > iq_hi) { continue; }
         }
         if let Some(c) = coolant {
-            if i < c.len() && c[i].is_finite() && c[i] < WARM_COOLANT_MIN_C { continue; }
+            if i < c.len() && c[i].is_finite() && c[i] < CAPS.warm_coolant_min_c { continue; }
         }
+        if let Some(p) = pedal {
+            if i < p.len() && p[i].is_finite() && p[i] >= WOT_PEDAL_CUTOFF_PCT { continue; }
+        }
+        if spec[i] <= 0.0 { continue; }
+        let dev = (actual[i] - spec[i]).abs() / spec[i];
+        if dev > worst { worst = dev; }
         samples += 1;
-        if duty[i] > max_duty { max_duty = duty[i]; }
     }
     if samples == 0 {
         return skipped(2, title, "no cruise-warm samples in log");
     }
-    if max_duty <= EGR_DUTY_OBSERVED_TOLERANCE_PCT {
-        pass(2, title, format!("max EGR duty at cruise = {max_duty:.1}% ({samples} samples)"))
+    if worst <= MAF_DEVIATION_FRACTION {
+        pass(2, title, format!("max cruise MAF deviation = {:.1} % ({samples} samples)", worst * 100.0))
     } else {
-        fail(2, title, format!("max EGR duty at cruise = {max_duty:.1}%"),
-            "Re-flash EGR-duty map; check both banks were written.")
+        fail(2, title, format!("max cruise MAF deviation = {:.1} % (> {:.0} %)",
+                worst * 100.0, MAF_DEVIATION_FRACTION * 100.0),
+            "Re-flatten arwMLGRDKF (Strategy B fill ≥850).")
     }
 }
 
-fn check3_egr_duty_wot(log: &VcdsLog) -> CheckOutcome {
-    let title = "EGR duty zero at WOT";
+fn check3_egr_duty_zero(log: &VcdsLog) -> CheckOutcome {
+    let title = "EGR duty ≤ 0 % anywhere";
     let Some(duty) = log.data.get("egr_duty") else {
         return skipped(3, title, "egr_duty channel missing");
     };
-    let Some(pedal) = log.data.get("tps_pct") else {
-        return skipped(3, title, "tps_pct channel missing");
+    let Some(max) = finite_max(duty) else {
+        return skipped(3, title, "no finite egr_duty samples");
     };
-    let mut max_duty = f64::NEG_INFINITY;
-    let mut samples = 0;
-    for i in 0..duty.len() {
-        if !duty[i].is_finite() || !pedal[i].is_finite() { continue; }
-        if pedal[i] < WOT_PEDAL_CUTOFF_PCT { continue; }
-        samples += 1;
-        if duty[i] > max_duty { max_duty = duty[i]; }
-    }
-    if samples == 0 {
-        return skipped(3, title, "no WOT samples in log");
-    }
-    if max_duty <= EGR_DUTY_OBSERVED_TOLERANCE_PCT {
-        pass(3, title, format!("max EGR duty at WOT = {max_duty:.1}% ({samples} samples)"))
+    if max <= EGR_DUTY_OBSERVED_TOLERANCE_PCT {
+        pass(3, title, format!("max EGR duty = {max:.1} %"))
     } else {
-        fail(3, title, format!("max EGR duty at WOT = {max_duty:.1}%"),
-            "Should already be zero pre-delete; raise spec-MAF further.")
+        fail(3, title, format!("max EGR duty = {max:.1} %"),
+            "Re-flash both banks of AGR_arwMEAB0KL/arwMEAB1KL to 0 %.")
     }
 }
 
-fn check4_spec_maf_saturated(log: &VcdsLog) -> CheckOutcome {
-    let title = "Spec-MAF saturated (Strategy B)";
-    let Some(spec) = log.data.get("maf_spec") else {
-        return skipped(4, title, "maf_spec channel missing");
-    };
-    let warm = warm_indices(log);
-    if warm.is_empty() {
-        return skipped(4, title, "no warm samples in log");
+fn check4_no_group_a_dtcs(log: &VcdsLog) -> CheckOutcome {
+    let title = "No P0401 / P0402 / P0403 in DTC sidecar";
+    if log.dtcs.is_empty() {
+        return skipped(4, title, "no DTC sidecar provided");
     }
-    let warm_spec: Vec<f64> = warm.iter().filter_map(|&i| spec.get(i).copied())
-        .filter(|x| x.is_finite())
+    let hits: Vec<&String> = log.dtcs.iter()
+        .filter(|d| DTC_GROUP_A.iter().any(|c| d.eq_ignore_ascii_case(c)))
         .collect();
-    let Some(min_spec) = finite_min(&warm_spec) else {
-        return skipped(4, title, "no finite maf_spec samples");
-    };
-    let threshold = SPEC_MAF_FILL_MGSTR - 50.0; // 800 from spec §7
-    if min_spec >= threshold {
-        pass(4, title, format!("min warm spec-MAF = {min_spec:.0} mg/stroke"))
-    } else {
-        fail(4, title, format!("min warm spec-MAF = {min_spec:.0} mg/stroke (< {threshold:.0})"),
-            "Re-flash arwMLGRDKF to ≥850 mg/stroke in both banks.")
-    }
-}
-
-fn check5_maf_actual_in_range(log: &VcdsLog) -> CheckOutcome {
-    let title = "MAF actual within HFM5 linear range";
-    let Some(actual) = log.data.get("maf_actual") else {
-        return skipped(5, title, "maf_actual channel missing");
-    };
-    let warm = warm_indices(log);
-    if warm.is_empty() {
-        return skipped(5, title, "no warm samples in log");
-    }
-    let warm_actual: Vec<f64> = warm.iter().filter_map(|&i| actual.get(i).copied())
-        .filter(|x| x.is_finite())
-        .collect();
-    let Some(max) = finite_max(&warm_actual) else {
-        return skipped(5, title, "no finite maf_actual samples");
-    };
-    let Some(min) = finite_min(&warm_actual) else {
-        return skipped(5, title, "no finite maf_actual samples");
-    };
-    let upper = CAPS.maf_max_mg_stroke - 50.0; // 950
-    if (100.0..=upper).contains(&max) && min >= 100.0 {
-        pass(5, title, format!("MAF actual range = {min:.0}..{max:.0} mg/stroke"))
-    } else {
-        fail(5, title,
-            format!("MAF actual range = {min:.0}..{max:.0} mg/stroke (out of 100..{upper:.0})"),
-            "If saturating, fit a larger MAF housing or check intake leak.")
-    }
-}
-
-fn dtc_present(log: &VcdsLog, code_int: u16) -> bool {
-    log.data.get("dtc_codes").is_some_and(|v| {
-        v.iter().any(|x| x.is_finite() && (x.round() as i64) == i64::from(code_int))
-    })
-}
-
-fn check6_no_p0401_p0402(log: &VcdsLog) -> CheckOutcome {
-    let title = "No P0401 / P0402 in DTC scan";
-    if !log.data.contains_key("dtc_codes") {
-        return skipped(6, title, "dtc_codes channel missing");
-    }
-    let mut hits: Vec<&'static str> = Vec::new();
-    if dtc_present(log, 401) { hits.push("P0401"); }
-    if dtc_present(log, 402) { hits.push("P0402"); }
     if hits.is_empty() {
-        pass(6, title, "no P0401/P0402 in scan".to_string())
+        pass(4, title, "no Group-A DTCs present".to_string())
     } else {
-        fail(6, title, format!("present: {}", hits.join(", ")),
-            "Widen DTC threshold (§3.5) or zero the DTC enable flag.")
+        let listed = hits.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ");
+        fail(4, title, format!("present: {listed}"),
+            "Widen DTC threshold (§9 default-deltas DTC_thresholds row); P0403 indicates real wiring fault.")
     }
 }
 
-fn check7_no_p0403(log: &VcdsLog) -> CheckOutcome {
-    let title = "No P0403 (solenoid wiring) in DTC scan";
-    if !log.data.contains_key("dtc_codes") {
-        return skipped(7, title, "dtc_codes channel missing");
-    }
-    if dtc_present(log, 403) {
-        fail(7, title, "P0403 present".to_string(),
-            "Real wiring fault on the still-installed EGR solenoid — investigate, do NOT just suppress.")
-    } else {
-        pass(7, title, "no P0403 in scan".to_string())
-    }
-}
-
-fn check8_no_p0404_to_p0406(log: &VcdsLog) -> CheckOutcome {
-    let title = "No P0404 / P0405 / P0406 in DTC scan";
-    if !log.data.contains_key("dtc_codes") {
-        return skipped(8, title, "dtc_codes channel missing");
-    }
-    let mut hits: Vec<&'static str> = Vec::new();
-    if dtc_present(log, 404) { hits.push("P0404"); }
-    if dtc_present(log, 405) { hits.push("P0405"); }
-    if dtc_present(log, 406) { hits.push("P0406"); }
-    if hits.is_empty() {
-        pass(8, title, "no P0404/P0405/P0406 in scan".to_string())
-    } else {
-        fail(8, title, format!("present: {}", hits.join(", ")),
-            "Unusual on AMF (no EGR position sensor) — investigate before suppressing.")
-    }
-}
-
-fn check9_idle_stability(log: &VcdsLog) -> CheckOutcome {
-    let title = "Idle stability";
+fn check5_idle_stability(log: &VcdsLog) -> CheckOutcome {
+    let title = "Idle stability (RPM σ ≤ 25 over warm-idle window)";
     let Some(rpm) = log.data.get("rpm") else {
-        return skipped(9, title, "rpm channel missing");
+        return skipped(5, title, "rpm channel missing");
     };
     let Some(coolant) = log.data.get("coolant_c") else {
-        return skipped(9, title, "coolant_c channel missing");
+        return skipped(5, title, "coolant_c channel missing");
     };
+    let pedal = log.data.get("pedal_pct");
     let iq = log.data.get("iq_actual").or_else(|| log.data.get("iq_requested"));
+
     let mut idle_rpm: Vec<f64> = Vec::new();
     for i in 0..rpm.len() {
-        if !rpm[i].is_finite() || !coolant[i].is_finite() { continue; }
-        if coolant[i] < 85.0 { continue; }
-        if let Some(iqv) = iq {
-            if i < iqv.len() && iqv[i].is_finite() && iqv[i] > 8.0 { continue; }
+        if !rpm[i].is_finite() { continue; }
+        if i >= coolant.len() || !coolant[i].is_finite() || coolant[i] < CAPS.warm_coolant_min_c {
+            continue;
         }
+        let idle_ok = match pedal {
+            Some(p) if i < p.len() && p[i].is_finite() => p[i] <= IDLE_PEDAL_MAX_PCT,
+            _ => match iq {
+                Some(q) if i < q.len() && q[i].is_finite() => q[i] <= IDLE_IQ_MAX_MG,
+                _ => true,
+            },
+        };
+        if !idle_ok { continue; }
         idle_rpm.push(rpm[i]);
     }
     if idle_rpm.is_empty() {
-        return skipped(9, title, "no warm-idle samples (T_coolant ≥ 85°C, IQ ≤ 8 mg)");
+        return skipped(5, title, "no warm-idle samples");
     }
     let Some((mean, std)) = finite_mean_std(&idle_rpm) else {
-        return skipped(9, title, "could not compute idle statistics");
+        return skipped(5, title, "could not compute idle statistics");
     };
     if std <= IDLE_INSTABILITY_THRESHOLD_RPM_STD {
-        pass(9, title, format!("RPM σ = {std:.1} (mean {mean:.0}, n={})", idle_rpm.len()))
+        pass(5, title, format!("RPM σ = {std:.1} (mean {mean:.0}, n={})", idle_rpm.len()))
     } else {
-        fail(9, title, format!("RPM σ = {std:.1} (> {} threshold)",
+        fail(5, title, format!("RPM σ = {std:.1} (> {} threshold)",
                 IDLE_INSTABILITY_THRESHOLD_RPM_STD),
-            "Apply conditional −1.5 mg/stroke idle-IQ trim (default-deltas Idle_fuel row).")
+            "Apply conditional −1.5 mg/stroke idle-IQ trim (Idle_fuel default-delta).")
     }
 }
 
-fn check10_cruise_nvh_proxy(_log: &VcdsLog) -> CheckOutcome {
-    // The spec marks this as a subjective check (driver note required).
-    // We can never pass it from a log alone; mark as Skipped with an
-    // explanatory note so the user supplies the marker manually.
-    skipped(10, "Cruise NVH proxy (subjective)",
-        "Subjective: log marker / driver note required. \
-         If complaint, apply −1.0° SOI retard cruise band (R18 / SOI_warm_cruise).")
-}
-
-fn check11_egt_within_envelope(log: &VcdsLog) -> CheckOutcome {
-    let title = "EGT modelled within envelope";
-    let egt = log.data.get("egt_model_c");
-    let Some(egt) = egt else {
-        return skipped(11, title, "egt_model_c channel missing");
-    };
-    let Some(max) = finite_max(egt) else {
-        return skipped(11, title, "no finite egt samples");
-    };
-    if max <= f64::from(CAPS.pre_turbo_egt_c_sustained) {
-        pass(11, title, format!("max modelled EGT = {max:.0}°C"))
-    } else {
-        fail(11, title, format!("max modelled EGT = {max:.0}°C (> {} cap)",
-                CAPS.pre_turbo_egt_c_sustained),
-            "Reduce IQ peak or trim SOI advance at the offending cells.")
-    }
-}
-
-fn check12_lambda_within_envelope(log: &VcdsLog) -> CheckOutcome {
-    let title = "Lambda modelled ≥ floor";
+fn check6_lambda_floor(log: &VcdsLog) -> CheckOutcome {
+    let title = "Lambda floor never breached at WOT";
     let Some(maf) = log.data.get("maf_actual") else {
-        return skipped(12, title, "maf_actual channel missing");
+        return skipped(6, title, "maf_actual channel missing");
     };
     let Some(iq) = log.data.get("iq_requested").or_else(|| log.data.get("iq_actual")) else {
-        return skipped(12, title, "iq_requested / iq_actual missing");
+        return skipped(6, title, "iq_requested / iq_actual missing");
     };
+    let pedal = log.data.get("pedal_pct");
     let mut min_lambda = f64::INFINITY;
     for i in 0..maf.len() {
         if i >= iq.len() { break; }
         if !maf[i].is_finite() || !iq[i].is_finite() || iq[i] <= 5.0 { continue; }
+        if let Some(p) = pedal {
+            if i < p.len() && p[i].is_finite() && p[i] < CAPS.pedal_wot_pct { continue; }
+        }
         let lam = maf[i] / (iq[i] * DIESEL_AFR_STOICH);
         if lam < min_lambda { min_lambda = lam; }
     }
     if !min_lambda.is_finite() {
-        return skipped(12, title, "no qualifying samples for λ model");
+        return skipped(6, title, "no qualifying WOT samples for λ model");
     }
     if min_lambda >= CAPS.lambda_floor {
-        pass(12, title, format!("min modelled λ = {min_lambda:.3}"))
+        pass(6, title, format!("min modelled λ at WOT = {min_lambda:.3}"))
     } else {
-        fail(12, title, format!("min modelled λ = {min_lambda:.3} (< {} floor)",
+        fail(6, title, format!("min modelled λ = {min_lambda:.3} (< {} floor)",
                 CAPS.lambda_floor),
-            "Smoke-limiter (IQ-by-MAF) re-shape needs revisit.")
+            "Smoke_IQ_by_MAF/MAP: raise IQ cap so λ ≥ 1.05.")
     }
 }
 
-fn check13_boost_within_envelope(log: &VcdsLog) -> CheckOutcome {
-    let title = "Boost actual ≤ envelope";
+fn check7_peak_iq(log: &VcdsLog) -> CheckOutcome {
+    let title = "Peak IQ ≤ 54 mg in any pull";
+    let Some(iq) = log.data.get("iq_requested").or_else(|| log.data.get("iq_actual")) else {
+        return skipped(7, title, "iq channel missing");
+    };
+    let Some(peak) = finite_max(iq) else {
+        return skipped(7, title, "no finite iq samples");
+    };
+    if peak <= CAPS.peak_iq_mg {
+        pass(7, title, format!("peak IQ = {peak:.1} mg/stroke"))
+    } else {
+        fail(7, title, format!("peak IQ = {peak:.1} mg/stroke (> {} cap)", CAPS.peak_iq_mg),
+            "Driver_Wish: cap WOT request at 54 mg/stroke.")
+    }
+}
+
+fn check8_boost_envelope(log: &VcdsLog) -> CheckOutcome {
+    let title = "Boost ≤ 2150 mbar abs anywhere";
     let Some(boost) = log.data.get("boost_actual") else {
-        return skipped(13, title, "boost_actual channel missing");
+        return skipped(8, title, "boost_actual channel missing");
     };
     let Some(max) = finite_max(boost) else {
-        return skipped(13, title, "no finite boost samples");
+        return skipped(8, title, "no finite boost samples");
     };
     if max <= f64::from(CAPS.peak_boost_mbar_abs) {
-        pass(13, title, format!("max boost = {max:.0} mbar"))
+        pass(8, title, format!("max boost = {max:.0} mbar abs"))
     } else {
-        fail(13, title, format!("max boost = {max:.0} mbar (> {} cap)",
-                CAPS.peak_boost_mbar_abs),
-            "LDRXN / LDRPMX too aggressive — drop.")
+        fail(8, title, format!("max boost = {max:.0} mbar (> {} cap)", CAPS.peak_boost_mbar_abs),
+            "LDRXN: lower 2000-3500 rpm cells.")
     }
 }
 
-fn check14_torque_limiter(log: &VcdsLog) -> CheckOutcome {
-    let title = "Modelled torque ≤ clutch limit";
+fn check9_soi_envelope(log: &VcdsLog) -> CheckOutcome {
+    let title = "SOI ≤ 26° BTDC at IQ ≥ 30 mg";
+    let Some(soi) = log.data.get("soi_actual") else {
+        return skipped(9, title, "soi_actual channel missing");
+    };
     let Some(iq) = log.data.get("iq_requested").or_else(|| log.data.get("iq_actual")) else {
-        return skipped(14, title, "iq channel missing");
+        return skipped(9, title, "iq channel missing");
     };
-    let Some(peak_iq) = finite_max(iq) else {
-        return skipped(14, title, "no finite iq samples");
-    };
-    let modelled_nm = peak_iq * NM_PER_MG_IQ;
-    if modelled_nm <= CAPS.modelled_flywheel_torque_nm {
-        pass(14, title, format!("peak modelled torque = {modelled_nm:.1} Nm"))
+    let mut worst = f64::NEG_INFINITY;
+    for i in 0..soi.len() {
+        if i >= iq.len() { break; }
+        if !soi[i].is_finite() || !iq[i].is_finite() { continue; }
+        if iq[i] >= CAPS.soi_iq_threshold_mg && soi[i] > worst { worst = soi[i]; }
+    }
+    if !worst.is_finite() {
+        return skipped(9, title, "no IQ ≥ 30 mg samples");
+    }
+    if worst <= CAPS.soi_max_btdc {
+        pass(9, title, format!("max SOI at IQ ≥ 30 mg = {worst:.1}° BTDC"))
     } else {
-        fail(14, title, format!("peak modelled torque = {modelled_nm:.1} Nm (> {} cap)",
-                CAPS.modelled_flywheel_torque_nm),
-            "Torque-limiter map: cap peak at 240 Nm.")
+        fail(9, title, format!("max SOI = {worst:.1}° BTDC (> {} cap)", CAPS.soi_max_btdc),
+            "SOI: cap warm-map cells at 26° BTDC absolute.")
     }
 }
 
-fn check15_smoke_switch_unchanged() -> CheckOutcome {
-    // Cannot be verified from a log alone — surfaces as a reminder.
-    pass(15, "MAP/MAF smoke-limiter switch unchanged",
-        "v3 mandate: 0x51C30 / 0x71C30 stays at 0x00 (MAF-based). \
-         Verify by reading the bin if available.".to_string())
+fn check10_cruise_nvh_subjective() -> CheckOutcome {
+    // Spec-mandated manual check: cruise NVH cannot be inferred from a
+    // log alone. v4 acceptance criterion #12 requires this to be Skipped.
+    skipped_with_note(
+        10,
+        "Cruise NVH (subjective)",
+        "manual / driver attestation required",
+        "Driver-marker required, not captured by analyser.",
+    )
 }
 
-/// Run all 15 §7 checks against `log` and return the aggregate report.
+fn check11_pre_post_idle_maf_delta(_log: &VcdsLog) -> CheckOutcome {
+    let title = "Pre-delete vs post-delete idle MAF delta ≥ +50 mg";
+    skipped_with_note(
+        11, title,
+        "no pre-delete log supplied",
+        "Pass `--pre <PRE.csv> --post <POST.csv>` to validate-egr-delete for the full check.",
+    )
+}
+
+fn check12_pre_egr_was_active(_log: &VcdsLog) -> CheckOutcome {
+    let title = "Pre-delete EGR duty > 5 % observed (sanity guard)";
+    skipped_with_note(
+        12, title,
+        "no pre-delete log supplied",
+        "Pass `--pre <PRE.csv>` to validate-egr-delete for the full check.",
+    )
+}
+
+fn check13_pulls_were_warm(log: &VcdsLog) -> CheckOutcome {
+    let title = "Coolant reached ≥ 80 °C during pulls";
+    let Some(c) = log.data.get("coolant_c") else {
+        return skipped(13, title, "coolant_c channel missing");
+    };
+    let Some(max) = finite_max(c) else {
+        return skipped(13, title, "no finite coolant samples");
+    };
+    if max >= CAPS.coolant_pull_min_c {
+        pass(13, title, format!("max coolant = {max:.1} °C"))
+    } else {
+        fail(13, title, format!("max coolant = {max:.1} °C (< {} pull integrity threshold)",
+                CAPS.coolant_pull_min_c),
+            "Re-log on a fully warm engine before validating.")
+    }
+}
+
+fn check14_fuel_temp(log: &VcdsLog) -> CheckOutcome {
+    let title = "Fuel temp ≤ 80 °C";
+    let Some(f) = log.data.get("fuel_temp_c") else {
+        return skipped(14, title, "fuel_temp_c channel missing (firmware-dependent)");
+    };
+    let Some(max) = finite_max(f) else {
+        return skipped(14, title, "no finite fuel_temp_c samples");
+    };
+    if max <= 80.0 {
+        pass(14, title, format!("max fuel temp = {max:.1} °C"))
+    } else {
+        fail(14, title, format!("max fuel temp = {max:.1} °C (> 80 °C)"),
+            "High fuel temp distorts IQ — investigate return restriction or hot soak.")
+    }
+}
+
+fn check15_smooth_running(log: &VcdsLog) -> CheckOutcome {
+    let title = "Smooth-running deviations ≤ ±2 mg";
+    let (Some(c1), Some(c2), Some(c3)) = (
+        log.data.get("srcv_cyl1"),
+        log.data.get("srcv_cyl2"),
+        log.data.get("srcv_cyl3"),
+    ) else {
+        return skipped(15, title, "smooth-running channels missing");
+    };
+    let n = c1.len().min(c2.len()).min(c3.len());
+    let mut worst: f64 = 0.0;
+    for i in 0..n {
+        let cells = [c1[i], c2[i], c3[i]];
+        if cells.iter().any(|x| !x.is_finite()) { continue; }
+        let mean = (cells[0] + cells[1] + cells[2]) / 3.0;
+        for c in cells {
+            let dev = (c - mean).abs();
+            if dev > worst { worst = dev; }
+        }
+    }
+    if worst <= 2.0 {
+        pass(15, title, format!("max cylinder deviation = {worst:.2} mg/stroke"))
+    } else {
+        fail(15, title, format!("max cylinder deviation = {worst:.2} mg/stroke (> 2.0)"),
+            "Investigate injectors / cam lobe before tuning further.")
+    }
+}
+
+/// Run all 15 §10 checks against `log` and return the aggregate report.
 pub fn validate_egr_delete(log: &VcdsLog) -> ValidationReport {
     let items = vec![
-        check1_egr_duty_idle(log),
-        check2_egr_duty_cruise(log),
-        check3_egr_duty_wot(log),
-        check4_spec_maf_saturated(log),
-        check5_maf_actual_in_range(log),
-        check6_no_p0401_p0402(log),
-        check7_no_p0403(log),
-        check8_no_p0404_to_p0406(log),
-        check9_idle_stability(log),
-        check10_cruise_nvh_proxy(log),
-        check11_egt_within_envelope(log),
-        check12_lambda_within_envelope(log),
-        check13_boost_within_envelope(log),
-        check14_torque_limiter(log),
-        check15_smoke_switch_unchanged(),
+        check1_idle_maf(log),
+        check2_cruise_maf(log),
+        check3_egr_duty_zero(log),
+        check4_no_group_a_dtcs(log),
+        check5_idle_stability(log),
+        check6_lambda_floor(log),
+        check7_peak_iq(log),
+        check8_boost_envelope(log),
+        check9_soi_envelope(log),
+        check10_cruise_nvh_subjective(),
+        check11_pre_post_idle_maf_delta(log),
+        check12_pre_egr_was_active(log),
+        check13_pulls_were_warm(log),
+        check14_fuel_temp(log),
+        check15_smooth_running(log),
     ];
     debug_assert_eq!(items.len(), 15);
-    let _wiring = DTC_WIRING_FAULTS; // referenced for symmetry with the rule pack
-    let _ = DTC_LIST_TO_SUPPRESS;    // ditto
     ValidationReport { items }
+}
+
+/// Two-log variant: also fills in the pre/post cross-checks (items 11/12).
+pub fn validate_egr_delete_pre_post(pre: &VcdsLog, post: &VcdsLog) -> ValidationReport {
+    let mut report = validate_egr_delete(post);
+
+    // Item 11: pre-delete vs post-delete idle MAF delta ≥ +50 mg.
+    let title11 = "Pre-delete vs post-delete idle MAF delta ≥ +50 mg";
+    let pre_idle = idle_min_maf(pre);
+    let post_idle = idle_min_maf(post);
+    report.items[10] = match (pre_idle, post_idle) {
+        (Some(p), Some(q)) => {
+            let delta = q - p;
+            if delta >= 50.0 {
+                pass(11, title11, format!("idle MAF Δ = +{delta:.0} mg/stroke (pre {p:.0} → post {q:.0})"))
+            } else {
+                fail(11, title11, format!("idle MAF Δ = +{delta:.1} mg/stroke (< 50)"),
+                    "Delete may not be flashed in pre-delete log; verify the pre-delete log captured EGR active.")
+            }
+        }
+        _ => skipped(11, title11, "could not extract idle MAF from one or both logs"),
+    };
+
+    // Item 12: pre-delete EGR duty > 5 % observed (proves the test was real).
+    let title12 = "Pre-delete EGR duty > 5 % observed (sanity guard)";
+    let pre_max_duty = pre.data.get("egr_duty").and_then(|d| finite_max(d));
+    report.items[11] = match pre_max_duty {
+        Some(m) if m > 5.0 => pass(12, title12, format!("pre-delete max EGR duty = {m:.1} %")),
+        Some(m) => fail(12, title12, format!("pre-delete max EGR duty = {m:.1} % (≤ 5)"),
+            "Pre-delete log shows no EGR activity — was the delete already flashed when the pre-log was captured?"),
+        None => skipped(12, title12, "pre-delete log has no egr_duty channel"),
+    };
+
+    report
+}
+
+fn idle_min_maf(log: &VcdsLog) -> Option<f64> {
+    let coolant = log.data.get("coolant_c")?;
+    let maf = log.data.get("maf_actual")?;
+    let pedal = log.data.get("pedal_pct");
+    let iq = log.data.get("iq_requested").or_else(|| log.data.get("iq_actual"));
+    let mut samples: Vec<f64> = Vec::new();
+    for i in 0..maf.len() {
+        if i >= coolant.len() || !coolant[i].is_finite() || coolant[i] < CAPS.warm_coolant_min_c {
+            continue;
+        }
+        let idle_ok = match pedal {
+            Some(p) if i < p.len() && p[i].is_finite() => p[i] <= IDLE_PEDAL_MAX_PCT,
+            _ => match iq {
+                Some(q) if i < q.len() && q[i].is_finite() => q[i] <= IDLE_IQ_MAX_MG,
+                _ => true,
+            },
+        };
+        if !idle_ok || !maf[i].is_finite() { continue; }
+        samples.push(maf[i]);
+    }
+    finite_min(&samples)
 }
 
 #[cfg(test)]
@@ -538,21 +598,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
-    fn empty_log() -> VcdsLog {
-        VcdsLog {
-            source_file: PathBuf::from("synth.csv"),
-            time: vec![],
-            data: BTreeMap::new(),
-            groups: BTreeSet::new(),
-            field_names: Default::default(),
-            units: Default::default(),
-            unmapped_columns: Vec::new(),
-            warnings: Vec::new(),
-            median_sample_dt_ms: 0.0,
-        }
-    }
-
-    fn synth(channels: &[(&str, Vec<f64>)]) -> VcdsLog {
+    fn synth(channels: &[(&str, Vec<f64>)], dtcs: Vec<String>) -> VcdsLog {
         let mut data: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         let n = channels.first().map_or(0, |(_, v)| v.len());
         for (k, v) in channels {
@@ -568,16 +614,30 @@ mod tests {
             unmapped_columns: Vec::new(),
             warnings: Vec::new(),
             median_sample_dt_ms: 200.0,
+            dtcs,
         }
     }
 
+    fn empty_log() -> VcdsLog {
+        synth(&[], Vec::new())
+    }
+
     #[test]
-    fn empty_log_skips_most_checks_but_passes_smoke_switch_reminder() {
+    fn check10_is_always_skipped_with_driver_marker_note() {
+        // v4 acceptance #12: check 10 is always Skipped with the
+        // driver-marker note.
+        let report = validate_egr_delete(&empty_log());
+        let item10 = &report.items[9];
+        assert_eq!(item10.id, 10);
+        assert_eq!(item10.status, CheckStatus::Skipped);
+        assert!(item10.remediation.contains("Driver-marker required"));
+    }
+
+    #[test]
+    fn empty_log_skips_most_checks() {
         let report = validate_egr_delete(&empty_log());
         assert_eq!(report.items.len(), 15);
-        // Smoke-switch check is informational and always passes.
-        assert_eq!(report.items[14].status, CheckStatus::Pass);
-        assert!(report.skipped() >= 12, "most checks skip with empty log");
+        assert!(report.skipped() >= 12);
     }
 
     #[test]
@@ -592,15 +652,18 @@ mod tests {
             ("maf_actual",   vec![300.0; n]),
             ("maf_spec",     vec![850.0; n]),
             ("boost_actual", vec![1000.0; n]),
-            ("tps_pct",      vec![5.0; n]),
-            ("dtc_codes",    vec![f64::NAN; n]),
-        ]);
+            ("pedal_pct",    vec![3.0; n]),
+            ("soi_actual",   vec![10.0; n]),
+        ], Vec::new());
         let r = validate_egr_delete(&log);
-        assert!(r.pass(), "post-delete happy path must pass: failed = {}", r.failed());
+        let failed: Vec<&str> = r.items.iter()
+            .filter(|i| i.status == CheckStatus::Fail)
+            .map(|i| i.title.as_str()).collect();
+        assert!(r.pass(), "post-delete happy path must pass: failed = {failed:?}");
     }
 
     #[test]
-    fn pre_delete_log_fails_egr_duty_checks() {
+    fn pre_delete_log_fails_egr_duty_check() {
         let n = 60;
         let log = synth(&[
             ("rpm",          vec![820.0; n]),
@@ -609,59 +672,54 @@ mod tests {
             ("iq_requested", vec![4.0; n]),
             ("iq_actual",    vec![4.0; n]),
             ("maf_actual",   vec![220.0; n]),
-            ("maf_spec",     vec![220.0; n]), // not saturated either
+            ("maf_spec",     vec![220.0; n]),
             ("boost_actual", vec![1000.0; n]),
-            ("tps_pct",      vec![5.0; n]),
-        ]);
+            ("pedal_pct",    vec![3.0; n]),
+        ], Vec::new());
         let r = validate_egr_delete(&log);
         assert!(!r.pass(), "pre-delete log must fail validation");
-        // Item 1 (EGR duty idle) and Item 4 (spec-MAF saturated) must fail.
-        assert_eq!(r.items[0].status, CheckStatus::Fail);
-        assert_eq!(r.items[3].status, CheckStatus::Fail);
+        let item3 = r.items.iter().find(|i| i.id == 3).unwrap();
+        assert_eq!(item3.status, CheckStatus::Fail);
     }
 
     #[test]
-    fn p0403_fails_check7() {
-        let n = 60;
-        let mut dtc = vec![f64::NAN; n];
-        dtc[5] = 403.0;
+    fn p0403_in_dtc_sidecar_fails_check4() {
+        let n = 30;
         let log = synth(&[
-            ("rpm", vec![820.0; n]),
-            ("egr_duty", vec![0.0; n]),
-            ("coolant_c", vec![88.0; n]),
-            ("iq_actual", vec![4.0; n]),
-            ("maf_actual", vec![300.0; n]),
-            ("maf_spec", vec![850.0; n]),
+            ("rpm",          vec![820.0; n]),
+            ("egr_duty",     vec![0.0; n]),
+            ("coolant_c",    vec![88.0; n]),
+            ("iq_actual",    vec![4.0; n]),
+            ("maf_actual",   vec![300.0; n]),
+            ("maf_spec",     vec![850.0; n]),
             ("boost_actual", vec![1000.0; n]),
-            ("tps_pct", vec![5.0; n]),
-            ("dtc_codes", dtc),
-        ]);
+            ("pedal_pct",    vec![3.0; n]),
+        ], vec!["P0403".to_string()]);
         let r = validate_egr_delete(&log);
-        let item7 = r.items.iter().find(|i| i.id == 7).unwrap();
-        assert_eq!(item7.status, CheckStatus::Fail);
-        assert!(item7.remediation.contains("wiring fault"));
+        let item4 = r.items.iter().find(|i| i.id == 4).unwrap();
+        assert_eq!(item4.status, CheckStatus::Fail);
     }
 
     #[test]
-    fn idle_instability_fails_check9() {
-        let n = 60;
+    fn idle_instability_fails_check5() {
+        let n = 200;
         let mut rpm = Vec::with_capacity(n);
         for i in 0..n {
             rpm.push(820.0 + (i as f64).sin() * 80.0); // σ ≫ 25
         }
         let log = synth(&[
-            ("rpm", rpm),
-            ("egr_duty", vec![0.0; n]),
-            ("coolant_c", vec![88.0; n]),
-            ("iq_actual", vec![4.0; n]),
+            ("rpm",        rpm),
+            ("egr_duty",   vec![0.0; n]),
+            ("coolant_c",  vec![88.0; n]),
+            ("pedal_pct",  vec![3.0; n]),
+            ("iq_actual",  vec![4.0; n]),
             ("maf_actual", vec![300.0; n]),
-            ("maf_spec", vec![850.0; n]),
+            ("maf_spec",   vec![850.0; n]),
             ("boost_actual", vec![1000.0; n]),
-            ("tps_pct", vec![5.0; n]),
-        ]);
+        ], Vec::new());
         let r = validate_egr_delete(&log);
-        let item9 = r.items.iter().find(|i| i.id == 9).unwrap();
-        assert_eq!(item9.status, CheckStatus::Fail);
+        let item5 = r.items.iter().find(|i| i.id == 5).unwrap();
+        assert_eq!(item5.status, CheckStatus::Fail);
     }
 
     #[test]
@@ -669,7 +727,35 @@ mod tests {
         let report = validate_egr_delete(&empty_log());
         let md = report.to_markdown();
         assert!(md.contains("## EGR Delete Validation Checklist"));
-        assert!(md.contains("[-]"), "skipped items render with [-]");
-        assert!(md.contains("**Result:"), "summary line present");
+        assert!(md.contains("[-]"));
+        assert!(md.contains("**Result:"));
+        assert!(md.contains("Driver-marker required"));
+    }
+
+    #[test]
+    fn pre_post_helper_fills_items_11_and_12() {
+        let n = 30;
+        let pre = synth(&[
+            ("rpm",          vec![820.0; n]),
+            ("egr_duty",     vec![32.0; n]),
+            ("coolant_c",    vec![88.0; n]),
+            ("iq_actual",    vec![4.0; n]),
+            ("maf_actual",   vec![205.0; n]),
+            ("pedal_pct",    vec![3.0; n]),
+        ], Vec::new());
+        let post = synth(&[
+            ("rpm",          vec![820.0; n]),
+            ("egr_duty",     vec![0.0; n]),
+            ("coolant_c",    vec![88.0; n]),
+            ("iq_actual",    vec![4.0; n]),
+            ("iq_requested", vec![4.0; n]),
+            ("maf_actual",   vec![300.0; n]),
+            ("maf_spec",     vec![850.0; n]),
+            ("boost_actual", vec![1000.0; n]),
+            ("pedal_pct",    vec![3.0; n]),
+        ], Vec::new());
+        let r = validate_egr_delete_pre_post(&pre, &post);
+        assert_eq!(r.items[10].status, CheckStatus::Pass, "item 11 should pass: pre=205 → post=300 Δ=95 ≥ 50");
+        assert_eq!(r.items[11].status, CheckStatus::Pass, "item 12 should pass: pre EGR duty 32 % > 5 %");
     }
 }

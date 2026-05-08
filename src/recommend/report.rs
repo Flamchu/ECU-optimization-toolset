@@ -1,4 +1,4 @@
-//! Markdown report writer.
+//! Markdown report writer (v4).
 
 use std::fs;
 use std::io;
@@ -31,17 +31,10 @@ fn severity_rank(s: Severity) -> u8 {
     match s { Severity::Critical => 2, Severity::Warn => 1, Severity::Info => 0 }
 }
 
-/// Render the full Markdown report to a string.
+/// Render the full Markdown report to a string. v4 single signature: an
+/// optional [`ValidationReport`] is appended as a Markdown subsection
+/// when supplied (CLI `--validate`).
 pub fn render_markdown(
-    result: &AnalysisResult,
-    recommendations: &[Recommendation],
-) -> String {
-    render_markdown_with_validation(result, recommendations, None)
-}
-
-/// Variant that appends an optional EGR-delete validation checklist
-/// section to the report.
-pub fn render_markdown_with_validation(
     result: &AnalysisResult,
     recommendations: &[Recommendation],
     validation: Option<&ValidationReport>,
@@ -65,6 +58,10 @@ pub fn render_markdown_with_validation(
         result.log.median_sample_dt_ms, low,
     ));
     lines.push(format!("- Pulls detected: `{}`", result.pulls.len()));
+    lines.push(format!(
+        "- DTCs from sidecar: `{}`",
+        if result.log.dtcs.is_empty() { "(none / no sidecar)".to_string() } else { result.log.dtcs.join(", ") },
+    ));
     lines.push(String::new());
 
     if !result.log.warnings.is_empty() {
@@ -75,15 +72,15 @@ pub fn render_markdown_with_validation(
         lines.push(String::new());
     }
 
-    // ---- v3 EGR Delete Strategy section -------------------------------
-    lines.push("## EGR Delete Strategy (v3)".to_string());
+    // ---- EGR Delete Strategy section ----------------------------------
+    lines.push("## EGR Delete Strategy (v4)".to_string());
     lines.push(String::new());
     lines.push(
-        "v3 mandates a software-only EGR delete. Hardware (EGR valve, cooler, \
+        "v4 mandates a software-only EGR delete. Hardware (EGR valve, cooler, \
          vacuum lines, ASV) stays installed; the vacuum-actuated valve is \
-         held closed by its return spring with 0 % duty. The MAF/MAP smoke \
-         switch is **explicitly unchanged** — MAF stays the closed-loop \
-         smoke-limiter input (see spec §3.2)."
+         held closed by its return spring with 0 % duty in both banks of \
+         the AGR map. The MAF/MAP smoke switch is **explicitly unchanged** — \
+         MAF stays the closed-loop smoke-limiter input (see spec §3.2)."
             .to_string(),
     );
     lines.push(String::new());
@@ -98,72 +95,88 @@ pub fn render_markdown_with_validation(
     }
     lines.push(String::new());
     lines.push(format!(
-        "Hard envelope (v3): λ ≥ {}, peak IQ ≤ {} mg/stroke, EGR duty = {} %, \
-         spec-MAF ≥ {} mg/stroke, peak boost ≤ {} mbar, modelled torque ≤ {} Nm.",
+        "Hard envelope (v4): λ ≥ {}, peak IQ ≤ {} mg/stroke, EGR duty = {} %, \
+         spec-MAF ≥ {} mg/stroke, peak boost ≤ {} mbar (≤ {} above 4000 rpm), \
+         modelled torque ≤ {} Nm, SOI ≤ {}° BTDC at IQ ≥ {} mg, EOI ≤ {}° ATDC, \
+         coolant pull-min {} °C, warm-cruise/idle min {} °C.",
         CAPS.lambda_floor, CAPS.peak_iq_mg, CAPS.egr_duty_max_pct,
         CAPS.spec_maf_fill_mg_stroke, CAPS.peak_boost_mbar_abs,
-        CAPS.modelled_flywheel_torque_nm,
+        CAPS.peak_boost_above_4000rpm_mbar_abs,
+        CAPS.modelled_flywheel_torque_nm, CAPS.soi_max_btdc, CAPS.soi_iq_threshold_mg,
+        CAPS.eoi_max_atdc, CAPS.coolant_pull_min_c, CAPS.warm_coolant_min_c,
     ));
     lines.push(String::new());
 
     if result.pulls.is_empty() {
         lines.push("## No WOT pulls detected".to_string());
-        lines.push(
-            "A pull requires pedal ≥ 95 % AND RPM rising AND duration ≥ 2 s. \
-             Re-log with full WOT acceleration runs from at least 2000 to 4500 rpm."
-                .to_string(),
-        );
-        return lines.join("\n");
+        lines.push(format!(
+            "A pull requires pedal ≥ {} % AND RPM rising AND duration ≥ 2 s. \
+             Re-log with full WOT acceleration runs from at least 2000 to 4500 rpm. \
+             Global rules (R16, R19, R21) may still produce findings.",
+             CAPS.pedal_wot_pct
+        ));
+        lines.push(String::new());
     }
 
-    lines.push("## Findings".to_string());
-    lines.push(String::new());
-    lines.push("| Pull | Rule | Severity | Observed | Threshold | Why |".to_string());
-    lines.push("|---|---|---|---|---|---|".to_string());
-    let mut sorted: Vec<&Finding> = result.findings.iter().collect();
-    sorted.sort_by(|a, b| {
-        severity_rank(b.severity).cmp(&severity_rank(a.severity))
-            .then_with(|| a.rule_id.cmp(b.rule_id))
-            .then_with(|| a.pull_id.cmp(&b.pull_id))
-    });
-    for f in &sorted {
-        let (obs, thr) = if f.skipped {
-            ("—".to_string(), "—".to_string())
-        } else {
-            (fmt_num(f.observed_extreme), fmt_num(f.threshold))
-        };
-        let rationale = f.rationale.replace('\n', " ");
-        lines.push(format!(
-            "| {} | `{}` | {} | {} | {} | {} |",
-            f.pull_id, f.rule_id, f.severity.as_str(), obs, thr, rationale,
-        ));
-    }
-    lines.push(String::new());
-
-    lines.push("## Per-pull summary".to_string());
-    lines.push(String::new());
-    for pull in &result.pulls {
-        lines.push(format!(
-            "### Pull {} — t={:.1}s..{:.1}s, RPM {:.0}→{:.0}, dur {:.1}s",
-            pull.pull_id, pull.t_start, pull.t_end,
-            pull.rpm_start, pull.rpm_end, pull.duration_s(),
-        ));
-        let pull_findings: Vec<&Finding> = result.findings.iter()
-            .filter(|f| f.pull_id == pull.pull_id && !f.skipped)
-            .collect();
-        if pull_findings.is_empty() {
-            lines.push("- No findings; pull is within envelope.".to_string());
-        } else {
-            for f in pull_findings {
-                lines.push(format!(
-                    "- **[{}] {}** — {} (observed {}, threshold {})",
-                    f.severity.as_str().to_ascii_uppercase(),
-                    f.rule_id, f.rationale.replace('\n', " "),
-                    fmt_num(f.observed_extreme), fmt_num(f.threshold),
-                ));
-            }
+    // Findings always rendered (global rules can fire without pulls).
+    if !result.findings.is_empty() {
+        lines.push("## Findings".to_string());
+        lines.push(String::new());
+        lines.push("| Pull | Rule | Severity | Observed | Threshold | Why |".to_string());
+        lines.push("|---|---|---|---|---|---|".to_string());
+        let mut sorted: Vec<&Finding> = result.findings.iter().collect();
+        sorted.sort_by(|a, b| {
+            severity_rank(b.severity).cmp(&severity_rank(a.severity))
+                .then_with(|| a.rule_id.cmp(b.rule_id))
+                .then_with(|| a.pull_id.cmp(&b.pull_id))
+        });
+        for f in &sorted {
+            let (obs, thr) = if f.skipped {
+                ("—".to_string(), "—".to_string())
+            } else {
+                (fmt_num(f.observed_extreme), fmt_num(f.threshold))
+            };
+            let rationale = f.rationale.replace('\n', " ");
+            let pull_label = if f.pull_id == 0 { "G".to_string() } else { f.pull_id.to_string() };
+            lines.push(format!(
+                "| {} | `{}` | {} | {} | {} | {} |",
+                pull_label, f.rule_id, f.severity.as_str(), obs, thr, rationale,
+            ));
         }
         lines.push(String::new());
+        lines.push(
+            "_Pull `G` denotes a finding from a global-scope rule (R16, R19, R21) \
+             evaluated once over the entire log rather than per-pull._".to_string()
+        );
+        lines.push(String::new());
+    }
+
+    if !result.pulls.is_empty() {
+        lines.push("## Per-pull summary".to_string());
+        lines.push(String::new());
+        for pull in &result.pulls {
+            lines.push(format!(
+                "### Pull {} — t={:.1}s..{:.1}s, RPM {:.0}→{:.0}, dur {:.1}s",
+                pull.pull_id, pull.t_start, pull.t_end,
+                pull.rpm_start, pull.rpm_end, pull.duration_s(),
+            ));
+            let pull_findings: Vec<&Finding> = result.findings.iter()
+                .filter(|f| f.pull_id == pull.pull_id && !f.skipped)
+                .collect();
+            if pull_findings.is_empty() {
+                lines.push("- No findings; pull is within envelope.".to_string());
+            } else {
+                for f in pull_findings {
+                    lines.push(format!(
+                        "- **[{}] {}** — {} (observed {}, threshold {})",
+                        f.severity.as_str().to_ascii_uppercase(),
+                        f.rule_id, f.rationale.replace('\n', " "),
+                        fmt_num(f.observed_extreme), fmt_num(f.threshold),
+                    ));
+                }
+            }
+            lines.push(String::new());
+        }
     }
 
     lines.push("## Recommendation table".to_string());
@@ -201,10 +214,11 @@ pub fn render_markdown_with_validation(
 pub fn write_report(
     result: &AnalysisResult,
     recommendations: &[Recommendation],
+    validation: Option<&ValidationReport>,
     out_dir: &Path,
 ) -> io::Result<PathBuf> {
     fs::create_dir_all(out_dir)?;
-    let md = render_markdown(result, recommendations);
+    let md = render_markdown(result, recommendations, validation);
     let path = out_dir.join(format!("report_{}.md", now_compact_utc()));
     fs::write(&path, md)?;
     Ok(path)
