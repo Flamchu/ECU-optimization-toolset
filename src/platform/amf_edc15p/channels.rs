@@ -40,8 +40,8 @@ pub const CHANNELS: &[Channel] = &[
     Channel { name: "boost_actual",   source: "011-3",                          unit: "mbar abs",  description: "PID-controlled actual" },
     Channel { name: "n75_duty",       source: "011-4",                          unit: "%",         description: "boost actuator drive" },
     Channel { name: "atm_pressure",   source: "010-2",                          unit: "mbar abs",  description: "ambient — capture key-on/engine-off" },
-    Channel { name: "pedal_pct",      source: "002-?|003-3-pedal",              unit: "%",         description: "driver-wish pedal % — used for WOT detection (≥ pedal_wot_pct) and R17 cruise filter" },
-    Channel { name: "tps_pct",        source: "010-3",                          unit: "%",         description: "throttle/anti-shudder valve % — diesel anti-shudder valve, NOT a driver-pedal proxy" },
+    Channel { name: "pedal_pct",      source: "010-4",                          unit: "%",         description: "driver-wish accelerator pedal % (G79). Group 010 field 4 is the canonical EDC15P+ TDI position. Used for WOT detection (≥ pedal_wot_pct) and the R17 cruise filter." },
+    Channel { name: "map_abs_010",    source: "010-3",                          unit: "mbar abs",  description: "MAP actual on group 010 field 3 (PD-TDI label convention). NOT throttle — TDI has no TPS. The anti-shudder valve diagnostic lives in basic-settings, not in measuring blocks." },
     Channel { name: "soi_actual",     source: "020-2",                          unit: "deg BTDC",  description: "logged start-of-injection" },
     Channel { name: "map_abs",        source: "020-3",                          unit: "mbar abs",  description: "MAP cross-check vs 011-3" },
     Channel { name: "load_pct",       source: "020-4",                          unit: "%",         description: "engine load" },
@@ -113,12 +113,26 @@ mod tests {
     }
 
     #[test]
-    fn pedal_pct_is_separate_from_tps_pct() {
-        // v4 fix G: pedal_pct is the canonical driver-wish channel; tps_pct
-        // is the diesel anti-shudder valve.
-        assert!(channel("pedal_pct").is_some());
-        assert!(channel("tps_pct").is_some());
-        assert!(channel("tps_pct").unwrap().description.contains("anti-shudder"));
+    fn pedal_pct_lives_at_group_010_field_4() {
+        // pedal_pct is the canonical driver-wish channel and lives at
+        // group 010 field 4 (G79 accelerator pedal sensor) on EDC15P+ TDI.
+        let p = channel("pedal_pct").expect("pedal_pct must be registered");
+        assert_eq!(p.source, "010-4");
+        assert!(!p.source.contains("002"),
+            "pedal_pct must not reference group 002 (idle-speed group, not pedal %)");
+    }
+
+    #[test]
+    fn no_tps_pct_channel_exists() {
+        // TDI has no throttle position sensor; the anti-shudder valve
+        // diagnostic lives in basic-settings, not in measuring blocks.
+        // Group 010 field 3 carries MAP actual on PD-TDI labels.
+        assert!(channel("tps_pct").is_none(),
+            "tps_pct must not be registered — TDI has no TPS");
+        let m = channel("map_abs_010").expect("map_abs_010 must replace the old tps_pct entry");
+        assert_eq!(m.source, "010-3");
+        assert!(m.description.contains("anti-shudder"));
+        assert!(m.description.contains("NOT throttle"));
     }
 
     #[test]

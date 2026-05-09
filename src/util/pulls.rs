@@ -1,8 +1,10 @@
 //! WOT-pull detection.
 //!
-//! Per spec §4.2: a "pull" is `pedal >= 95 %` AND `RPM rising` AND
-//! `duration >= 2 s`. The driver-pedal channel is `tps_pct` on AMF
-//! (group 010-3). When TPS is missing, IQ-based fallback is used.
+//! A "pull" is `pedal_pct >= 95 %` AND `RPM rising` AND `duration >= 2 s`.
+//! The driver-pedal channel is `pedal_pct` (group 010 field 4, G79
+//! accelerator-pedal sensor on EDC15P+ TDI). When `pedal_pct` is missing,
+//! the detector falls back to engine-load percent and finally to an
+//! IQ-based heuristic at 50 % of session-max IQ.
 
 use crate::util::timebase::ResampledLog;
 
@@ -98,7 +100,7 @@ pub fn detect_pulls(log: &ResampledLog) -> Vec<Pull> {
 }
 
 fn build_wot_mask(log: &ResampledLog, n: usize) -> Option<Vec<bool>> {
-    for cand in ["tps_pct", "pedal", "load_pct"] {
+    for cand in ["pedal_pct", "load_pct"] {
         if log.has(cand) {
             let v = log.get(cand)?;
             return Some(v.iter().map(|x| x.is_finite() && *x >= PEDAL_THRESHOLD_PCT).collect());
@@ -145,13 +147,13 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
-    fn synth_log(rpm: Vec<f64>, tps: Vec<f64>) -> ResampledLog {
+    fn synth_log(rpm: Vec<f64>, pedal: Vec<f64>) -> ResampledLog {
         let n = rpm.len();
         let dt = 0.2;
         let time: Vec<f64> = (0..n).map(|i| i as f64 * dt).collect();
         let mut data = BTreeMap::new();
         data.insert("rpm".to_string(), rpm);
-        data.insert("tps_pct".to_string(), tps);
+        data.insert("pedal_pct".to_string(), pedal);
         ResampledLog { time, data }
     }
 
@@ -165,15 +167,15 @@ mod tests {
     fn synth_pull_detected() {
         let n = 60;
         let rpm: Vec<f64> = (0..n).map(|i| 1500.0 + (i as f64) * 50.0).collect();
-        let tps = vec![100.0; n];
-        let log = synth_log(rpm, tps);
+        let pedal = vec![100.0; n];
+        let log = synth_log(rpm, pedal);
         let pulls = detect_pulls(&log);
         assert_eq!(pulls.len(), 1);
         assert!(pulls[0].duration_s() >= MIN_DURATION_S);
     }
 
     #[test]
-    fn iq_fallback_when_no_tps() {
+    fn iq_fallback_when_no_pedal_or_load() {
         let n = 60;
         let rpm: Vec<f64> = (0..n).map(|i| 1500.0 + (i as f64) * 50.0).collect();
         let mut iq = vec![5.0; n];
