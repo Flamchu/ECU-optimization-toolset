@@ -70,15 +70,19 @@ pair zeroes both banks defensively; if a future analysis shows bank B is
 unused on AMF this is harmless, and if bank B *is* the active map on a
 mis-identified ECU file the parity prevents the delete failing.
 
-## 9. Driver_Wish dimensions and parallel banks (R22 / Driver_Wish_low_pedal)
+## 9. Driver_Wish parallel banks (R22 / Driver_Wish_low_pedal)
 
-EDC15P+ bins commonly contain 2 parallel `mrwFVH_KF` banks; the AMF
-Driver_Wish has been reported as having up to 9 banks (gear / condition
-variants). The R22 algorithm operates on logged behaviour, not on the
-binary, so the dimension uncertainty does not block the rule. The
-`Driver_Wish_low_pedal` recommendation must be applied to ALL parallel
-banks consistently — the symbolic action description says so, and the
-WinOLS operator is expected to use parallel-map mode.
+EDC15P+ binaries carry **5** parallel `mrwFVH_KF` (Driver_Wish) maps.
+Per the public DAMOS `cowFUN_DSV` codeblock-detail symbol, banks 1 and
+4 are the automatic-codeblock variants and banks 2, 3, 5 are the manual
+variants. On the manual Fabia 6Y2 only banks 2/3/5 are read at runtime,
+but standard EDC15P+ tuning practice is to mirror all 5 banks
+identically to remain coding-state-invariant. The R22 algorithm
+operates on logged behaviour, not on the binary, so the bank count
+does not block the rule. The `Driver_Wish_low_pedal` recommendation
+must be applied to ALL 5 parallel banks consistently — the symbolic
+action description says so, and the WinOLS operator is expected to use
+parallel-map mode.
 
 ## 10. EDC15P+ fan-stage map naming on AMF (Fan_thresholds / Fan_run_on)
 
@@ -115,7 +119,8 @@ include observed fan-stage transitions.
 
 Public PD150 dumps show Driver_Wish maxing out at ~50 mg/stroke at
 100 % pedal in mid-rpm, with low-pedal cells in the single digits to
-low teens. PD75 (AMF) is reported as a 13×16 layout with up to 9
-parallel banks; no canonical numeric reference is embedded here. The
-R22 algorithm computes slopes from the **logged** behaviour, not from a
-stock-value assumption, so this uncertainty does not block the rule.
+low teens. PD75 (AMF) is reported as a 13×16 layout with 5 parallel
+banks (per `cowFUN_DSV`); no canonical numeric reference is embedded
+here. The R22 algorithm computes slopes from the **logged** behaviour,
+not from a stock-value assumption, so this uncertainty does not block
+the rule.

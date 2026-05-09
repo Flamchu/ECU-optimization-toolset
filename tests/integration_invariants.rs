@@ -1,5 +1,5 @@
-//! v4 invariants: cross-cutting acceptance checks that don't fit any
-//! single module's unit tests.
+//! Cross-cutting invariants — checks that don't fit any single
+//! module's unit tests.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -11,21 +11,21 @@ use ecu_shenanigans::platform::amf_edc15p::envelope::CAPS;
 use ecu_shenanigans::util::resample_to_uniform;
 
 #[test]
-fn cargo_version_is_5_0_0() {
-    assert_eq!(ecu_shenanigans::VERSION, "5.0.0");
+fn cargo_version_pinned() {
+    assert_eq!(ecu_shenanigans::VERSION, "6.0.0");
 }
 
 #[test]
 fn cargo_binary_name_unchanged() {
     let cargo = std::fs::read_to_string("Cargo.toml").expect("Cargo.toml");
     assert!(cargo.contains("name = \"ecu-shenanigans\""));
-    assert!(cargo.contains("version = \"5.0.0\""));
+    assert!(cargo.contains("version = \"6.0.0\""));
 }
 
-/// Build the wrong-turbo identifier at runtime so this very file
-/// doesn't trip the search. v4 acceptance #16 says the string must
-/// not appear anywhere in source / docs / tests; the test itself
-/// references it only via run-time concatenation to stay clean.
+/// Build the wrong-turbo identifier at runtime so this very file does
+/// not trip the search. The misidentification string must not appear
+/// anywhere in source / docs / tests; the test itself references it
+/// only via run-time concatenation to stay clean.
 fn wrong_turbo_token() -> String {
     let mut s = String::from("KP");
     s.push_str("35");
@@ -108,11 +108,17 @@ fn vehicle_speed_channel_lists_group_005() {
 }
 
 #[test]
-fn pedal_pct_is_separate_from_tps_pct_channel() {
+fn pedal_pct_lives_at_g79_position() {
+    // pedal_pct is the canonical driver-wish channel and lives at group
+    // 010 field 4 (G79 accelerator pedal sensor) on EDC15P+ TDI. The
+    // diesel has no TPS, so no tps_pct channel exists either.
     let pedal = channel("pedal_pct").expect("pedal_pct missing");
-    let tps = channel("tps_pct").expect("tps_pct missing");
-    assert_ne!(pedal.name, tps.name);
-    assert!(tps.description.to_ascii_lowercase().contains("anti-shudder"));
+    assert_eq!(pedal.source, "010-4");
+    assert!(channel("tps_pct").is_none(),
+        "tps_pct must not be registered — TDI has no throttle position sensor");
+    let map_alt = channel("map_abs_010")
+        .expect("map_abs_010 must replace tps_pct on group 010 field 3");
+    assert!(map_alt.description.to_ascii_lowercase().contains("anti-shudder"));
 }
 
 #[test]

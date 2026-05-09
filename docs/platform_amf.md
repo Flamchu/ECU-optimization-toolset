@@ -60,11 +60,21 @@ chew the LUK SMF. The conservative target this tool aims at:
 3. **PD75 injectors** — at ~54 mg/stroke they approach the duration
    headroom of the stock cam lobe; EOI starts pushing past 10° ATDC and
    EGT climbs sharply.
-4. **Cast-iron manifold** — durable, but cracks at the runner-collector
-   weld under repeated 850 °C+ thermal cycles.
-5. **Stock pistons** — aluminium, no oil-jets on AMF. SOI advance > 26°
-   BTDC at high IQ migrates peak cylinder pressure ahead of TDC and
-   stresses the unjacketed pistons.
+4. **Cast-iron exhaust manifold + journal-bearing turbine wheel** — the
+   binding EGT constraint. SiMo51-grade ductile cast iron service ceiling
+   is ~750 °C sustained (Ekström & Jonsson 2014); above this creep
+   accumulates over hundreds of hours, and repeated 850 °C+ thermal
+   cycles crack the runner-collector weld. The Garrett GT1544S journal-
+   bearing turbine's Inconel 713C wheel runs out of conservative
+   sustained margin around 830–850 °C. The 800 °C transient cap brackets
+   both.
+5. **SOI advance and peak cylinder pressure** — beyond 26° BTDC at IQ
+   ≥ 30 mg, peak cylinder pressure migrates ahead of TDC. Pistons
+   themselves are NOT the weak point on AMF — the 1.4 TDI 3-cyl shares
+   the 1.9 PD bottom-end lubrication architecture per SSP 223 and DOES
+   carry piston oil-spray cooling — but the rotating assembly and head
+   gasket are still stressed by ahead-of-TDC peak pressure, and the
+   timing belt sees higher peak loads.
 6. **MAF mg/stroke ceiling** — the EDC15P+ map quantisation tops out
    around 1000 mg/stroke. The Bosch HFM5 itself does not saturate at
    AMF airflows; this is a map-side limit, not a sensor limit.
@@ -83,7 +93,7 @@ the `.bin`.
 | `LDOLLR` | LDR-Sollwertbegrenzung | RPM × atm-pressure | mbar | Cap at 2150 mbar at sea level |
 | `SVBL` | Ladedruck-Begrenzung absolut | scalar | mbar | Leave stock |
 | `Driver_Wish` | Fahrerwunsch | Pedal % × RPM | mg/str | Set to 50 mg @ pedal 100 % × rpm 1800–3500 |
-| `Driver_Wish_low_pedal` | Fahrerwunsch (Pedal 1..25 %) | Pedal % × RPM | mg/str | Flatten dIQ/dpedal ≤ 0.40 across the 5..25 % band; preserve idle creep |
+| `Driver_Wish_low_pedal` | Fahrerwunsch (Pedal 1..25 %) | Pedal % × RPM | mg/str | Flatten dIQ/dpedal ≤ 0.40 across the 5..25 % band; preserve idle creep. **Apply identically to all 5 parallel banks** (`mrwFVH_KF` × 5; banks 2/3/5 active on manual codeblock, 1/4 on automatic — mirror all 5 to remain coding-state-invariant) |
 | `Smoke_IQ_by_MAF` | Begrenzungsmenge (MAF) | MAF × RPM | mg/str | Enforce λ ≥ 1.05 |
 | `Smoke_IQ_by_MAP` | Begrenzungsmenge (MAP) | Boost × RPM | mg/str | Same λ discipline |
 | `Torque_Limiter` | Drehmomentbegrenzer | RPM × atm-pressure | Nm | Cap at 240 Nm |

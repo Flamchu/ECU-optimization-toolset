@@ -1,6 +1,8 @@
-//! Standing audit suite — items A1..A15 from the build-time correctness
-//! specification. Kept as a regression after the audit closed; failure
-//! here indicates a behavioural regression of a load-bearing invariant.
+//! Standing audit suite — load-bearing invariants pinned as a
+//! regression. Failure here indicates a behavioural regression of a
+//! contractual invariant (rule pack shape, default-deltas count,
+//! validation checklist shape, turbo identifier, channel sourcing,
+//! EGT rationale).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -67,13 +69,14 @@ fn a3_envelope_clamps_are_pure_and_total() {
 // tests/integration_invariants.rs::resampler_locf_holds_egr_duty_across_gap.
 
 #[test]
-fn a6_r17_reads_pedal_pct_not_tps_pct() {
+fn a6_r17_reads_pedal_pct() {
     let r17 = ALL_RULES.iter().find(|r| r.id == "R17")
         .expect("R17 must exist");
     assert!(r17.requires_channels.contains(&"pedal_pct"),
         "R17 must declare pedal_pct in required channels");
+    // tps_pct does not exist in the channel registry; defence-in-depth.
     assert!(!r17.requires_channels.contains(&"tps_pct"),
-        "R17 must NOT use tps_pct (anti-shudder valve, not driver pedal)");
+        "R17 must NOT use tps_pct (channel removed: TDI has no TPS)");
 }
 
 #[test]
@@ -194,6 +197,47 @@ fn a15_canonical_turbo_string_and_no_misidentification() {
         "GT1544S must be cited in ≥4 user-facing files; got {hits_correct}");
     assert!(hits_wrong.is_empty(),
         "Misidentified turbo string found in: {hits_wrong:?}");
+}
+
+#[test]
+fn a18_egt_rationale_corrected() {
+    use std::path::Path;
+    let mut bodies: Vec<(String, String)> = Vec::new();
+    for p in ["src/platform/amf_edc15p/envelope.rs",
+              "README.md",
+              "docs/platform_amf.md"] {
+        let path = Path::new(p);
+        if path.exists() {
+            let body = std::fs::read_to_string(path).unwrap_or_default();
+            bodies.push((p.to_string(), body));
+        }
+    }
+    // Forbidden phrasing — the false claim must be gone everywhere.
+    let forbidden = [
+        "no piston-cooling oil jets",
+        "no oil cooling jets",
+        "no piston cooling jets",
+        "AMF has no piston",
+        "without piston-cooling",
+    ];
+    for (path, body) in &bodies {
+        let lower = body.to_ascii_lowercase();
+        for needle in forbidden {
+            assert!(!lower.contains(&needle.to_ascii_lowercase()),
+                "{path}: forbidden phrase '{needle}' must be removed (AMF has piston oil-spray cooling per SSP 223)");
+        }
+    }
+    // Required phrasing — the corrected rationale must be present in envelope.rs.
+    let env = bodies.iter().find(|(p, _)| p.contains("envelope.rs"))
+        .expect("envelope.rs must be present").1.as_str();
+    let lower = env.to_ascii_lowercase();
+    assert!(lower.contains("simo")
+            || lower.contains("cast iron")
+            || lower.contains("cast-iron"),
+        "envelope.rs EGT cap rationale must reference SiMo / cast iron manifold");
+    assert!(lower.contains("turbine")
+            || lower.contains("inconel"),
+        "envelope.rs EGT cap rationale must reference turbine wheel / Inconel");
 }
 
 #[test]

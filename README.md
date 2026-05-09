@@ -36,7 +36,7 @@ Suite by hand.
 | Peak boost above 4000 rpm | **2050 mbar** | GT1544S choke flow + shaft overspeed risk |
 | Peak IQ | **54 mg/stroke** | PD75 nozzle duration headroom + LUK clutch ceiling |
 | λ floor | **1.05** | Diesel combustion floor (incomplete combustion below this) |
-| EGT (sustained) | **800 °C** | Cast-iron manifold creep + AMF has no piston-cooling oil jets |
+| EGT (peak / sustained target) | **800 °C peak / 750 °C sustained target** | SiMo51 cast-iron manifold creep limit (≤ 750 °C sustained per Ekström & Jonsson 2014); GT1544S Inconel 713C turbine wheel reaches conservative fatigue limit ~830–850 °C |
 | SOI advance | **26° BTDC at IQ ≥ 30 mg** | Beyond this, peak cylinder pressure migrates ahead of TDC |
 | EOI | **≤ 10° ATDC** | Past this, heat dumps into the turbine |
 | Modelled flywheel torque | **240 Nm** | LUK SMF clutch (engineering judgement, not LUK spec) |
