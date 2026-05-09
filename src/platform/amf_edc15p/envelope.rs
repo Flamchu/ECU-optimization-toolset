@@ -36,8 +36,16 @@ pub struct EnvelopeCaps {
     /// soot ramp, EGT spike. Unified at 1.05 (was inconsistent 1.05/1.20
     /// across v3 modules).
     pub lambda_floor: f64,
-    /// Cast-iron manifold creep onset ≥750 °C; 800 °C sustained binding cap.
-    /// Pistons have no oil cooling jets on AMF, which makes this load-bearing.
+    /// Pre-turbine EGT ceiling (°C). The binding constraint is the
+    /// SiMo51-style ductile cast iron exhaust manifold: published creep-
+    /// rupture limit is ~750 °C sustained service, with the
+    /// ferrite→austenite phase transformation at 860 °C as the absolute
+    /// hard ceiling (Ekström & Jonsson, *Materials Science & Engineering
+    /// A* 616:78–87, 2014). The Garrett GT1544S Inconel 713C turbine
+    /// wheel runs out of conservative sustained-service margin around
+    /// 830–850 °C (BorgWarner aftermarket material). The 800 °C cap is
+    /// therefore a transient-peak ceiling that brackets manifold creep
+    /// and turbine fatigue; sustained operation should target ≤ 750 °C.
     pub pre_turbo_egt_c_sustained: i32,
 
     /// SOI advance cap (deg BTDC) at IQ ≥ `soi_iq_threshold_mg`.

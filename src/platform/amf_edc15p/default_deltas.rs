@@ -273,7 +273,12 @@ pub const DEFAULT_DELTAS: &[DefaultDelta] = &[
                (95-100 / ~102 °C convention). Hysteresis preserved at ≥ 5 °C; \
                stages stay at least 4 °C apart; never below the thermostat. \
                Longevity-positive after EGR delete (cast-iron manifold soaks heat \
-               with no recirc cooling). All values capped via clamp_fan_on_c.",
+               with no recirc cooling). All values capped via clamp_fan_on_c. \
+               NOTE: on the A/C-equipped 6Y2 the 1H0959481B thermoswitch \
+               (95-on/84-off low + 102-on/91-off high) remains hard-wired in \
+               parallel with the J293 fan control module — the ECU CAN command \
+               earlier turn-on but CANNOT raise turn-on above the thermoswitch \
+               closure points.",
     },
     DefaultDelta {
         map_name: "Fan_run_on",

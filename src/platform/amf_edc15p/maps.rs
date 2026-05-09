@@ -186,10 +186,13 @@ pub const MAPS: &[MapDef] = &[
         name: "Driver_Wish_low_pedal",
         german_alias: "Fahrerwunsch (Pedal 1..25 %)",
         x_axis: "pedal_pct", y_axis: "rpm",
-        cell_unit: "mg/stroke", typical_dim: "13x16 (community-reported, up to 9 parallel banks)",
+        cell_unit: "mg/stroke", typical_dim: "13x16 with 5 parallel banks (per cowFUN_DSV)",
         description: "View of the Driver_Wish (Fahrerwunsch / mrwFVH_KF) restricted \
                       to the 1..25 % pedal column band. Edits here flatten the off-idle \
-                      slope; mid- and high-pedal cells are not modified.",
+                      slope; mid- and high-pedal cells are not modified. EDC15P+ carries \
+                      5 parallel banks (banks 2/3/5 manual, 1/4 automatic per cowFUN_DSV \
+                      codeblock detail); apply the flatten identically to all 5 banks to \
+                      remain coding-state-invariant.",
     },
     MapDef {
         name: "Fan_thresholds",
